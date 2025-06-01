@@ -35,9 +35,6 @@ cd ChessGame
 ```
 
 2. Cài đặt các thư viện cần thiết:
-```bash
-pip install -r requirements.txt
-```
 
 3. (Tùy chọn) Cài đặt PyTorch với hỗ trợ CUDA nếu bạn có GPU:
 ```bash
