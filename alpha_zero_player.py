@@ -2,8 +2,11 @@ import numpy as np
 import torch
 import time
 import os
+import random
 from interface import ChessAI
 from train_ai import TrainableChessAI
+from typing import Tuple  
+from chess_board import ChessBoard, Position, PieceColor  
 from board_encoder import ChessEncoder
 from alpha_zero_mcts import AlphaZeroMCTS
 from alphazero_model import AlphaZeroNetwork
@@ -63,41 +66,79 @@ class AlphaZeroPlayer(TrainableChessAI):
         self.self_play_data = []
         self.last_state = None
         self.board_history = []
+        
+        # Test model with a simple input
+        try:
+            test_input = np.zeros((119, 8, 8), dtype=np.float32)
+            policy, value = self.network.predict(test_input)
+            print(f"Neural network initialized: policy shape={policy.shape}, value={value}")
+        except Exception as e:
+            print(f"Warning: Neural network test failed: {e}")
     
-    def _best_move(self, board, color):
+    def get_move(self, board: ChessBoard, color: PieceColor) -> Tuple[Position, Position]:
         """
-        Use MCTS to find the best move
+        Get the next move from the AI.
+        Override from ChessAI interface.
         
         Args:
-            board: Current board state
+            board: Current chess board state
             color: Color to play (PieceColor.WHITE or PieceColor.BLACK)
             
         Returns:
-            from_pos, to_pos: Selected move
+            Tuple of (from_position, to_position) representing the move
         """
-        # Check if it's our turn
-        if board.turn != color:
-            raise ValueError(f"Not {color}'s turn to move")
-        
-        # Save the board state for training data
-        self.last_state = board.copy_board()
-        
-        # Run MCTS simulations to get move probabilities
-        moves, probabilities = self.mcts.get_move_probabilities(
-            board, temperature=self.config['temperature']
-        )
-        
-        # Store the MCTS policy for training
-        self.last_mcts_policy = {move: prob for move, prob in zip(moves, probabilities)}
-        
-        # Choose a move based on the probabilities
-        chosen_idx = np.random.choice(len(moves), p=probabilities)
-        chosen_move = moves[chosen_idx]
-        
-        # Update MCTS tree with the chosen move
-        self.mcts.update_with_move(chosen_move)
-        
-        return chosen_move
+        try:
+            # Check if it's our turn
+            if board.turn != color:
+                print(f"Warning: Not {color}'s turn to move")
+                # Tìm tất cả nước đi hợp lệ cho color
+                return self._random_move(board, color)
+                
+            # Save the board state for training data
+            self.last_state = board.copy_board()
+            
+            # Khởi tạo last_mcts_policy nếu chưa có
+            if not hasattr(self, 'last_mcts_policy'):
+                self.last_mcts_policy = {}
+            
+            # Reset MCTS tree trước mỗi nước đi để tránh lỗi
+            self.mcts.root = None
+            
+            # Run MCTS simulations to get move probabilities
+            moves, probabilities = self.mcts.get_move_probabilities(
+                board, temperature=self.config['temperature']
+            )
+            
+            # Xử lý trường hợp không có nước đi
+            if not moves or len(moves) == 0:
+                print("No valid moves returned by MCTS, using random move")
+                return self._random_move(board, color)
+            
+            # Store the MCTS policy for training
+            self.last_mcts_policy = {move: prob for move, prob in zip(moves, probabilities)}
+            
+            # Kiểm tra tính hợp lệ của probabilities
+            if np.isnan(probabilities).any() or np.sum(probabilities) == 0:
+                print("Invalid probabilities, using uniform distribution")
+                probabilities = np.ones(len(moves)) / len(moves)
+            
+            # Choose a move based on the probabilities
+            chosen_idx = np.random.choice(len(moves), p=probabilities)
+            chosen_move = moves[chosen_idx]
+            
+            # Update MCTS tree with the chosen move
+            try:
+                self.mcts.update_with_move(chosen_move)
+            except Exception as e:
+                print(f"Warning: Could not update MCTS tree: {e}")
+            
+            return chosen_move
+            
+        except Exception as e:
+            print(f"Error in get_move: {e}")
+            # Fallback to random move in case of error
+            print("Falling back to random move")
+            return self._random_move(board, color)
     
     def record_game_result(self, result):
         """

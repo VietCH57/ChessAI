@@ -168,8 +168,12 @@ class AlphaZeroMCTS:
         # Make a copy of the board to avoid modifying the original
         board_copy = board.copy_board()
         
-        # Apply the move
-        board_copy.make_move(from_pos, to_pos)
+        # Sửa phần này: Dùng move_piece thay vì make_move
+        try:
+            board_copy.move_piece(from_pos, to_pos)
+        except Exception as e:
+            print(f"Error in move_piece during simulation: {e}")
+            return -1.0  # Trả về giá trị xấu nếu gặp lỗi
         
         # Add board to history for repetition detection
         self.move_history.append(board_copy)
@@ -228,6 +232,21 @@ class AlphaZeroMCTS:
             # Apply temperature and normalize to get probabilities
             visit_counts = np.array(visit_counts) ** (1.0 / temperature)
             probabilities = visit_counts / np.sum(visit_counts)
+        
+        return moves, probabilities
+    
+        if not moves:
+            print("WARNING: No moves found in MCTS tree")
+            # Tìm các nước đi hợp lệ để debug
+            valid_moves = []
+            for row in range(8):
+                for col in range(8):
+                    pos = Position(row, col)
+                    piece = board.get_piece(pos)
+                    if piece.color == board.turn:
+                        moves_list = board.get_valid_moves(pos)
+                        valid_moves.extend([(pos, move.end_pos) for move in moves_list])
+            print(f"Board has {len(valid_moves)} valid moves")
         
         return moves, probabilities
 

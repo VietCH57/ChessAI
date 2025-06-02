@@ -7,7 +7,7 @@ This file contains default configuration settings for the AlphaZero implementati
 DEFAULT_CONFIG = {
     # Self-play parameters
     'num_self_play_games': 200,         # Number of self-play games per iteration
-    'num_simulations': 1600,             # MCTS simulations per move during self-play
+    'num_simulations': 800,             # MCTS simulations per move during self-play
     'max_moves_per_game': 512,          # Maximum moves per self-play game
     
     # Training parameters
