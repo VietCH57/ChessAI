@@ -6,25 +6,25 @@ This file contains default configuration settings for the AlphaZero implementati
 # Default configuration for AlphaZero training
 DEFAULT_CONFIG = {
     # Self-play parameters
-    'num_self_play_games': 200,         # Number of self-play games per iteration
+    'num_self_play_games': 128,         # Number of self-play games per iteration
     'num_parallel_games': 8,            # Number of parallel self-play games
-    'num_simulations': 800,             # MCTS simulations per move during self-play
+    'num_simulations': 400,             # MCTS simulations per move during self-play
     'max_moves_per_game': 512,          # Maximum moves per self-play game
     
     # Training parameters
-    'batch_size': 2048,                 # Batch size for training
-    'epochs': 40,                       # Epochs per training iteration
+    'batch_size': 1024,                 # Batch size for training
+    'epochs': 25,                       # Epochs per training iteration
     'learning_rate': 0.001,             # Learning rate
     'weight_decay': 1e-4,               # L2 regularization coefficient
     'num_iterations': 100,              # Total training iterations
     'scheduler': 'cosine',              # Learning rate scheduler ('cosine', 'step', or 'none')
     
     # Network parameters
-    'num_res_blocks': 20,               # Residual blocks in the network
-    'num_filters': 256,                 # Filters in convolutional layers
+    'num_res_blocks': 12,               # Residual blocks in the network
+    'num_filters': 128,                 # Filters in convolutional layers
     
     # Evaluation parameters
-    'evaluation_games': 80,             # Number of games for evaluation
+    'evaluation_games': 50,             # Number of games for evaluation
     'evaluation_threshold': 0.55,       # Win rate threshold to update best model
     
     # MCTS parameters
@@ -35,12 +35,12 @@ DEFAULT_CONFIG = {
     
     # File paths
     'output_dir': 'alphazero_models',   # Directory to save models
-    'replay_buffer_size': 500000,       # Maximum number of examples in replay buffer
+    'replay_buffer_size': 200000,       # Maximum number of examples in replay buffer
     
     # CUDA parameters
     'use_cuda': True,                   # Whether to use CUDA for training
     'mixed_precision': True,            # Whether to use mixed precision training
-    'num_workers': 4,                   # Number of dataloader workers
+    'num_workers': 2,                   # Number of dataloader workers
     'pin_memory': True,                 # Pin memory for faster GPU transfer
 }
 
