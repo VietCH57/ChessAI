@@ -8,7 +8,7 @@ def main():
     
     # Tesla P100 optimized parameters
     parser.add_argument('--iterations', type=int, default=50)       
-    parser.add_argument('--episodes-per-iter', type=int, default=25)  
+    parser.add_argument('--episodes-per-iter', type=int, default=50)
     parser.add_argument('--simulations', type=int, default=200)      
     parser.add_argument('--batch-size', type=int, default=64)         
     parser.add_argument('--learning-rate', type=float, default=0.002) 
