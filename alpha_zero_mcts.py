@@ -26,6 +26,9 @@ class MCTSNode:
         
     def select(self, c_puct):
         """Select a child according to the PUCT formula"""
+        # Add virtual loss to discourage other threads from selecting the same node
+        self.visit_count += 1  # Virtual loss
+        
         # Find the best child based on UCB formula
         best_score = -float('inf')
         best_move = None
@@ -47,6 +50,7 @@ class MCTSNode:
         
         if best_move is None:
             # This shouldn't happen if the node has children
+            self.visit_count -= 1  # Remove virtual loss
             raise ValueError("No best move found in select() - node has no children")
             
         return best_move, self.children[best_move]
@@ -76,6 +80,10 @@ class AlphaZeroMCTS:
     
     def _simulate_one(self, board, current_node):
         """Perform one MCTS simulation"""
+        # Cache state hash once before checking - more efficient
+        encoded_state = self.encoder.encode_board(board, self.move_history)
+        state_hash = hash(str(encoded_state.tobytes()))
+        
         # Check if game is over
         if board.is_checkmate(board.turn):
             return -1.0  # Loss from current player's perspective
@@ -180,7 +188,7 @@ class AlphaZeroMCTS:
             return 0.0
 
     def get_move_probabilities(self, board, temperature=1.0):
-        """Run simulations and get move probabilities"""
+        """Run simulations and get move probabilities"""  
         try:
             # Initialize the root node if not already initialized
             if self.root is None:
@@ -221,6 +229,12 @@ class AlphaZeroMCTS:
                 top_moves = sorted(zip(moves, visit_counts), key=lambda x: x[1], reverse=True)[:5]
             else:
                 print("WARNING: No moves found after simulations")
+            # Add Dirichlet noise at root node for exploration (only during training)
+            if add_exploration_noise and moves:
+                noise = np.random.dirichlet([0.3] * len(moves))
+                for i, (move, child) in enumerate(self.root.children.items()):
+                    child.prior_p = 0.75 * child.prior_p + 0.25 * noise[i]
+
             
             # If no moves found, fall back to all valid moves with uniform distribution
             if not moves:

@@ -14,12 +14,12 @@ class ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(num_filters)
     
     def forward(self, x):
-        residual = x
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
-        x += residual
-        x = F.relu(x)
-        return x
+        residual = x  
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out)) 
+        out += residual 
+        out = F.relu(out)  
+        return out
 
 class AlphaZeroNetwork(nn.Module):
     def __init__(self, num_res_blocks=20, num_filters=256, device=None):
