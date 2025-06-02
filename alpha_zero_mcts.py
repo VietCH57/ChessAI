@@ -1,12 +1,12 @@
 import math
 import numpy as np
+import torch
 from chess_board import ChessBoard, Position, PieceType, PieceColor
 from board_encoder import ChessEncoder
 
 class MCTSNode:
     """
     Node in the Monte Carlo Tree Search
-    Tracks visit counts, total value, and prior probability
     """
     def __init__(self, prior_p):
         self.visit_count = 0
@@ -25,11 +25,7 @@ class MCTSNode:
         return self.value_sum / self.visit_count
         
     def select(self, c_puct):
-        """
-        Select a child according to the PUCT formula used in AlphaZero
-        
-        U(s,a) = Q(s,a) + c_puct * P(s,a) * sqrt(sum(N(s,b)))/(1+N(s,a))
-        """
+        """Select a child according to the PUCT formula"""
         # Find the best child based on UCB formula
         best_score = -float('inf')
         best_move = None
@@ -49,70 +45,43 @@ class MCTSNode:
                 best_score = score
                 best_move = move
         
+        if best_move is None:
+            # This shouldn't happen if the node has children
+            raise ValueError("No best move found in select() - node has no children")
+            
         return best_move, self.children[best_move]
     
     def expand(self, moves_probs):
-        """
-        Expand the node with moves and their prior probabilities
-        
-        Args:
-            moves_probs: List of (move, prob) tuples
-        """
+        """Expand the node with moves and their prior probabilities"""
         for move, prob in moves_probs:
             if move not in self.children:
                 self.children[move] = MCTSNode(prior_p=prob)
     
     def update(self, value):
-        """
-        Update node statistics with a new value
-        
-        Args:
-            value: Value from the perspective of the player who made the move
-        """
+        """Update node statistics with a new value"""
         self.visit_count += 1
         self.value_sum += value
 
 
 class AlphaZeroMCTS:
-    """
-    Monte Carlo Tree Search as used in AlphaZero
-    """
+    """Monte Carlo Tree Search for AlphaZero"""
     def __init__(self, network, encoder, num_simulations=800, c_puct=1.0):
-        """
-        Initialize the MCTS
-        
-        Args:
-            network: Neural network for policy and value prediction
-            encoder: Board encoder
-            num_simulations: Number of simulations per move (800 in AlphaZero)
-            c_puct: Exploration constant in PUCT formula
-        """
         self.network = network
         self.encoder = encoder
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.root = None
         self.move_history = []
-
+        self.prediction_cache = {}  # Cache for network predictions
+    
     def _simulate_one(self, board, current_node):
-        """
-        Perform one MCTS simulation
-        
-        Args:
-            board: Current board state
-            current_node: Current node in the search tree
-            
-        Returns:
-            Leaf node value from the current player's perspective
-        """
+        """Perform one MCTS simulation"""
         # Check if game is over
         if board.is_checkmate(board.turn):
-            # Return -1 if checkmate (loss from current player's perspective)
-            return -1.0
+            return -1.0  # Loss from current player's perspective
         
         if board.is_stalemate(board.turn) or board.is_fifty_move_rule_draw() or board.is_threefold_repetition():
-            # Return 0 if draw
-            return 0.0
+            return 0.0  # Draw
             
         # Check if node is a leaf node (not expanded)
         if not current_node.expanded():
@@ -120,7 +89,17 @@ class AlphaZeroMCTS:
             encoded_state = self.encoder.encode_board(board, self.move_history)
             
             # Get policy and value prediction from neural network
-            policy_logits, value = self.network.predict(encoded_state)
+            state_hash = hash(str(encoded_state.tobytes()))
+            if state_hash in self.prediction_cache:
+                policy_logits, value = self.prediction_cache[state_hash]
+            else:
+                try:
+                    policy_logits, value = self.network.predict(encoded_state)
+                    self.prediction_cache[state_hash] = (policy_logits, value)
+                except Exception as e:
+                    print(f"ERROR in network prediction: {e}")
+                    # Return a default value to avoid crashing
+                    return 0.0
             
             # Get valid moves
             valid_moves = []
@@ -133,10 +112,15 @@ class AlphaZeroMCTS:
                         for move in moves:
                             valid_moves.append((pos, move.end_pos))
             
+            # Debug if no valid moves
+            if not valid_moves:
+                print(f"WARNING: No valid moves found for {board.turn}!")
+                print(f"Board state: {board.board}")
+                return 0.0  # Return draw value
+            
             # Prepare moves with probabilities for expansion
             moves_probs = []
             for from_pos, to_pos in valid_moves:
-                # Convert positions to indices in policy vector
                 move_key = (from_pos.row, from_pos.col, to_pos.row, to_pos.col)
                 if move_key in self.encoder.move_to_index:
                     idx = self.encoder.move_to_index[move_key]
@@ -151,116 +135,126 @@ class AlphaZeroMCTS:
                 else:
                     # If all probabilities are 0, use uniform distribution
                     moves_probs = [(move, 1.0/len(moves_probs)) for move, _ in moves_probs]
+            else:
+                # This shouldn't happen if valid_moves is non-empty
+                print("WARNING: No moves with probabilities available!")
+                return 0.0
             
             # Expand current node
             current_node.expand(moves_probs)
             
-            # Return predicted value from neural network
-            # Negate because value is from the perspective of the player to move in the neural network,
-            # but we need it from the perspective of the player who made the move to this position
+            # Return predicted value
             return -value
         
         # Node has been expanded before, continue simulation
-        # Select best child according to PUCT formula
-        move, child_node = current_node.select(self.c_puct)
-        from_pos, to_pos = move
-        
-        # Make a copy of the board to avoid modifying the original
-        board_copy = board.copy_board()
-        
-        # Sửa phần này: Dùng move_piece thay vì make_move
         try:
-            board_copy.move_piece(from_pos, to_pos)
+            # Select best child according to PUCT formula
+            move, child_node = current_node.select(self.c_puct)
+            from_pos, to_pos = move
+            
+            # Make a copy of the board to avoid modifying the original
+            board_copy = board.copy_board()
+            
+            # Make the move
+            result = board_copy.move_piece(from_pos, to_pos)
+            if not result:
+                print(f"WARNING: Invalid move in simulation: {from_pos.row},{from_pos.col} -> {to_pos.row},{to_pos.col}")
+                return 0.0
+            
+            # Add board to history for repetition detection
+            self.move_history.append(board_copy)
+            
+            # Recursively simulate from the child node
+            value = -self._simulate_one(board_copy, child_node)
+            
+            # Remove the board from history
+            self.move_history.pop()
+            
+            # Update current node statistics
+            child_node.update(value)
+            
+            return value
+            
         except Exception as e:
-            print(f"Error in move_piece during simulation: {e}")
-            return -1.0  # Trả về giá trị xấu nếu gặp lỗi
-        
-        # Add board to history for repetition detection
-        self.move_history.append(board_copy)
-        
-        # Recursively simulate from the child node
-        value = -self._simulate_one(board_copy, child_node)  # Negate for alternating players
-        
-        # Remove the board from history
-        self.move_history.pop()
-        
-        # Update current node statistics
-        current_node.update(value)
-        
-        return value
+            print(f"ERROR in simulation: {e}")
+            return 0.0
 
     def get_move_probabilities(self, board, temperature=1.0):
-        """
-        Run simulations and get move probabilities based on visit counts
-        
-        Args:
-            board: Current board state
-            temperature: Temperature for exploration (1=explore, 0=best move)
+        """Run simulations and get move probabilities"""
+        try:
+            # Initialize the root node if not already initialized
+            if self.root is None:
+                self.root = MCTSNode(prior_p=1.0)
             
-        Returns:
-            moves: List of possible moves
-            probabilities: Probability distribution based on visit counts
-        """
-        # Initialize the root node if not already initialized
-        if self.root is None:
-            self.root = MCTSNode(prior_p=1.0)
-        
-        # Store the current board state for future simulations
-        self.current_board = board.copy_board()
-        self.move_history = []  # Reset move history
-        
-        # Run simulations
-        for _ in range(self.num_simulations):
-            board_copy = self.current_board.copy_board()
-            self._simulate_one(board_copy, self.root)
-        
-        # Get move visits from root
-        moves = []
-        visit_counts = []
-        
-        for move, child in self.root.children.items():
-            moves.append(move)
-            visit_counts.append(child.visit_count)
-        
-        # Apply temperature
-        if temperature == 0:
-            # Choose the move with highest visit count
-            best_idx = np.argmax(visit_counts)
-            probabilities = np.zeros(len(moves))
-            probabilities[best_idx] = 1.0
-        else:
-            # Apply temperature and normalize to get probabilities
-            visit_counts = np.array(visit_counts) ** (1.0 / temperature)
-            probabilities = visit_counts / np.sum(visit_counts)
-        
-        return moves, probabilities
-    
-        if not moves:
-            print("WARNING: No moves found in MCTS tree")
-            # Tìm các nước đi hợp lệ để debug
-            valid_moves = []
+            # Store the current board state for future simulations
+            self.current_board = board.copy_board()
+            self.move_history = []  # Reset move history
+            self.prediction_cache = {}  # Clear prediction cache
+            
+            # Debug to check if the board has valid moves
+            total_valid_moves = 0
             for row in range(8):
                 for col in range(8):
                     pos = Position(row, col)
                     piece = board.get_piece(pos)
                     if piece.color == board.turn:
-                        moves_list = board.get_valid_moves(pos)
-                        valid_moves.extend([(pos, move.end_pos) for move in moves_list])
-            print(f"Board has {len(valid_moves)} valid moves")
-        
-        return moves, probabilities
-
-    def update_with_move(self, last_move):
-        """
-        Update the tree with the selected move, recycling the subtree if possible
-        
-        Args:
-            last_move: Last move made in the game
-        """
-        if self.root and last_move in self.root.children:
-            # Reuse the subtree for the played move
-            self.root = self.root.children[last_move]
-            self.root.parent = None
-        else:
-            # Reset the tree for a new search
-            self.root = None
+                        moves = board.get_valid_moves(pos)
+                        total_valid_moves += len(moves)
+            
+            print(f"Board has {total_valid_moves} valid moves before simulations")
+            
+            # Run simulations
+            for i in range(self.num_simulations):
+                board_copy = self.current_board.copy_board()
+                self._simulate_one(board_copy, self.root)
+            
+            # Get move visits from root
+            moves = []
+            visit_counts = []
+            
+            for move, child in self.root.children.items():
+                moves.append(move)
+                visit_counts.append(child.visit_count)
+            
+            # Debug info
+            if moves:
+                top_moves = sorted(zip(moves, visit_counts), key=lambda x: x[1], reverse=True)[:5]
+            else:
+                print("WARNING: No moves found after simulations")
+            
+            # If no moves found, fall back to all valid moves with uniform distribution
+            if not moves:
+                valid_moves = []
+                for row in range(8):
+                    for col in range(8):
+                        pos = Position(row, col)
+                        piece = board.get_piece(pos)
+                        if piece.color == board.turn:
+                            moves_list = board.get_valid_moves(pos)
+                            valid_moves.extend([(pos, move.end_pos) for move in moves_list])
+                
+                print(f"Falling back to {len(valid_moves)} valid moves with uniform distribution")
+                moves = valid_moves
+                visit_counts = [1] * len(valid_moves)
+            
+            # Apply temperature
+            if len(moves) == 0:
+                # No moves available - should never happen if the board state is valid
+                print("CRITICAL ERROR: No moves available!")
+                raise ValueError("No moves available to select from")
+            
+            if temperature == 0 or len(moves) == 1:
+                # Choose the move with highest visit count
+                best_idx = np.argmax(visit_counts)
+                probabilities = np.zeros(len(moves))
+                probabilities[best_idx] = 1.0
+            else:
+                # Apply temperature and normalize to get probabilities
+                visit_counts = np.array(visit_counts) ** (1.0 / temperature)
+                probabilities = visit_counts / np.sum(visit_counts)
+            
+            return moves, probabilities
+            
+        except Exception as e:
+            print(f"ERROR in get_move_probabilities: {e}")
+            raise

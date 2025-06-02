@@ -22,29 +22,31 @@ class ResidualBlock(nn.Module):
         return x
 
 class AlphaZeroNetwork(nn.Module):
-    def __init__(self, num_res_blocks=20, num_filters=256):
+    def __init__(self, num_res_blocks=20, num_filters=256, device=None):
         """
         AlphaZero neural network with:
         - Input: 8×8×119 planes representing board state
-        - Body: 20 residual blocks with 256 filters
+        - Body: Configurable residual blocks with configurable filters
         - Heads:
             - Policy head: outputs logits for all legal moves
             - Value head: outputs scalar ∈ [−1, 1]
         """
         super(AlphaZeroNetwork, self).__init__()
+        
+        # Set device (GPU/CPU)
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"AlphaZero network initialized on: {self.device}")
 
-        # Input layer: 119 input planes -> 256 filters
+        # Input layer: 119 input planes -> num_filters
         self.conv_input = nn.Conv2d(119, num_filters, kernel_size=3, padding=1)
         self.bn_input = nn.BatchNorm2d(num_filters)
 
-        # Residual blocks: 20 blocks with 256 filters each
+        # Residual blocks
         self.residual_blocks = nn.ModuleList([
             ResidualBlock(num_filters) for _ in range(num_res_blocks)
         ])
 
         # Policy head: outputs logits for all possible moves (1968 = 8×8×8×8 + 8×8×3)
-        # - 8×8×8×8 covers all possible from-to square combinations
-        # - 8×8×3 covers underpromotions (knight, bishop, rook) - queen promotion is part of the from-to
         self.policy_conv = nn.Conv2d(num_filters, 32, kernel_size=1)
         self.policy_bn = nn.BatchNorm2d(32)
         self.policy_fc = nn.Linear(32 * 8 * 8, 1968)
@@ -54,6 +56,9 @@ class AlphaZeroNetwork(nn.Module):
         self.value_bn = nn.BatchNorm2d(1)
         self.value_fc1 = nn.Linear(8 * 8, 256)
         self.value_fc2 = nn.Linear(256, 1)
+        
+        # Move model to device
+        self.to(self.device)
 
     def forward(self, x):
         """Forward pass through the network"""
@@ -82,8 +87,8 @@ class AlphaZeroNetwork(nn.Module):
         Make a prediction given an encoded board state
         Returns policy logits and value
         """
-        # Convert numpy array to torch tensor
-        x = torch.FloatTensor(encoded_state)
+        # Convert numpy array to torch tensor and move to device
+        x = torch.FloatTensor(encoded_state).to(self.device)
         
         # Add batch dimension if not already present
         if len(x.shape) == 3:
@@ -91,6 +96,48 @@ class AlphaZeroNetwork(nn.Module):
             
         # Forward pass
         with torch.no_grad():
+            self.eval()  # Set to evaluation mode
             policy_logits, value = self.forward(x)
             
-        return policy_logits.numpy(), value.item()
+        # Move results back to CPU for numpy conversion
+        return policy_logits.cpu().numpy(), value.item()
+
+    def save_checkpoint(self, filepath, optimizer=None, iteration=None, config=None):
+        """
+        Save model checkpoint with optimizer state
+        """
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'config': config if config else {},
+        }
+        
+        if optimizer is not None:
+            checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+        
+        if iteration is not None:
+            checkpoint['iteration'] = iteration
+            
+        torch.save(checkpoint, filepath)
+        
+    def load_checkpoint(self, filepath, optimizer=None):
+        """
+        Load model checkpoint and optimizer state if provided
+        Returns the iteration number if available
+        """
+        # Map location allows loading models saved from any device
+        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        self.load_state_dict(checkpoint['model_state_dict'])
+        
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # Move optimizer state to correct device
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(self.device)
+        
+        iteration = checkpoint.get('iteration', 0)
+        config = checkpoint.get('config', {})
+        
+        return iteration, config

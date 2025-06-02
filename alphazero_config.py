@@ -7,6 +7,7 @@ This file contains default configuration settings for the AlphaZero implementati
 DEFAULT_CONFIG = {
     # Self-play parameters
     'num_self_play_games': 200,         # Number of self-play games per iteration
+    'num_parallel_games': 8,            # Number of parallel self-play games
     'num_simulations': 800,             # MCTS simulations per move during self-play
     'max_moves_per_game': 512,          # Maximum moves per self-play game
     
@@ -16,6 +17,7 @@ DEFAULT_CONFIG = {
     'learning_rate': 0.001,             # Learning rate
     'weight_decay': 1e-4,               # L2 regularization coefficient
     'num_iterations': 100,              # Total training iterations
+    'scheduler': 'cosine',              # Learning rate scheduler ('cosine', 'step', or 'none')
     
     # Network parameters
     'num_res_blocks': 20,               # Residual blocks in the network
@@ -34,6 +36,12 @@ DEFAULT_CONFIG = {
     # File paths
     'output_dir': 'alphazero_models',   # Directory to save models
     'replay_buffer_size': 500000,       # Maximum number of examples in replay buffer
+    
+    # CUDA parameters
+    'use_cuda': True,                   # Whether to use CUDA for training
+    'mixed_precision': True,            # Whether to use mixed precision training
+    'num_workers': 4,                   # Number of dataloader workers
+    'pin_memory': True,                 # Pin memory for faster GPU transfer
 }
 
 def load_config(config_path=None):

@@ -3,6 +3,7 @@ import torch
 import time
 import os
 import random
+import traceback  # Import for better error reporting
 from interface import ChessAI
 from train_ai import TrainableChessAI
 from typing import Tuple  
@@ -12,25 +13,19 @@ from alpha_zero_mcts import AlphaZeroMCTS
 from alphazero_model import AlphaZeroNetwork
 
 class AlphaZeroPlayer(TrainableChessAI):
-    """
-    AlphaZero chess AI 
-    """
+    """AlphaZero chess AI"""
     def __init__(self, config=None):
-        """
-        Initialize AlphaZero player
-        
-        Args:
-            config: Configuration dictionary with parameters
-        """
+        """Initialize AlphaZero player"""
         # Default configuration
         default_config = {
-            'num_simulations': 800,  # Number of MCTS simulations per move
-            'c_puct': 1.0,          # Exploration constant in PUCT formula
-            'temperature': 1.0,      # Temperature for move selection (1=explore, 0=best)
-            'num_res_blocks': 20,    # Number of residual blocks in the network
-            'num_filters': 256,      # Number of filters in convolutional layers
-            'exploration_rate': 0.0, # Exploration rate for random moves during play
-            'model_file': None,      # Path to saved model file
+            'num_simulations': 800,     # Number of MCTS simulations per move
+            'c_puct': 1.0,              # Exploration constant in PUCT formula
+            'temperature': 1.0,         # Temperature for move selection
+            'num_res_blocks': 20,       # Number of residual blocks
+            'num_filters': 256,         # Number of filters
+            'exploration_rate': 0.0,    # Random move probability
+            'model_file': None,         # Path to model file
+            'use_cuda': True,           # Whether to use CUDA
         }
         
         # Update default config with provided config
@@ -41,15 +36,30 @@ class AlphaZeroPlayer(TrainableChessAI):
         # Initialize base class
         super().__init__(exploration_rate=self.config['exploration_rate'])
         
-        # Initialize neural network
-        self.network = AlphaZeroNetwork(
-            num_res_blocks=self.config['num_res_blocks'], 
-            num_filters=self.config['num_filters']
-        )
+        # Set device
+        if self.config['use_cuda'] and torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print(f"AlphaZero player using CUDA: {torch.cuda.get_device_name(0)}")
+        else:
+            self.device = torch.device("cpu")
+            print("AlphaZero player using CPU")
         
-        # Load model if provided
-        if self.config['model_file'] and os.path.exists(self.config['model_file']):
-            self.load_model(self.config['model_file'])
+        # Initialize neural network
+        try:
+            self.network = AlphaZeroNetwork(
+                num_res_blocks=self.config['num_res_blocks'], 
+                num_filters=self.config['num_filters'],
+                device=self.device
+            )
+            
+            # Load model if provided
+            if self.config['model_file'] and os.path.exists(self.config['model_file']):
+                self.load_model(self.config['model_file'])
+            
+        except Exception as e:
+            print(f"Error initializing network: {e}")
+            traceback.print_exc()
+            raise
         
         # Initialize encoder
         self.encoder = ChessEncoder()
@@ -74,42 +84,73 @@ class AlphaZeroPlayer(TrainableChessAI):
             print(f"Neural network initialized: policy shape={policy.shape}, value={value}")
         except Exception as e:
             print(f"Warning: Neural network test failed: {e}")
+            traceback.print_exc()
+    
+    def _random_move(self, board: ChessBoard, color: PieceColor) -> Tuple[Position, Position]:
+        """Get a random valid move (fallback)"""
+        valid_moves = []
+        for row in range(8):
+            for col in range(8):
+                pos = Position(row, col)
+                piece = board.get_piece(pos)
+                if piece.color == color:
+                    moves = board.get_valid_moves(pos)
+                    valid_moves.extend([(pos, move.end_pos) for move in moves])
+        
+        if not valid_moves:
+            print(f"ERROR: No valid moves found for {color}")
+            # This should never happen unless the game is over
+            raise ValueError(f"No valid moves for {color}")
+        
+        return random.choice(valid_moves)
     
     def get_move(self, board: ChessBoard, color: PieceColor) -> Tuple[Position, Position]:
-        """
-        Get the next move from the AI.
-        Override from ChessAI interface.
-        
-        Args:
-            board: Current chess board state
-            color: Color to play (PieceColor.WHITE or PieceColor.BLACK)
-            
-        Returns:
-            Tuple of (from_position, to_position) representing the move
-        """
+        """Get the next move from the AI"""
         try:
             # Check if it's our turn
             if board.turn != color:
                 print(f"Warning: Not {color}'s turn to move")
-                # Tìm tất cả nước đi hợp lệ cho color
                 return self._random_move(board, color)
                 
             # Save the board state for training data
             self.last_state = board.copy_board()
             
-            # Khởi tạo last_mcts_policy nếu chưa có
+            # Initialize last_mcts_policy if needed
             if not hasattr(self, 'last_mcts_policy'):
                 self.last_mcts_policy = {}
             
-            # Reset MCTS tree trước mỗi nước đi để tránh lỗi
+            # Reset MCTS tree for each move
             self.mcts.root = None
             
             # Run MCTS simulations to get move probabilities
+            start_time = time.time()
+            
+            # Check if board has any valid moves
+            has_valid_moves = False
+            for row in range(8):
+                for col in range(8):
+                    pos = Position(row, col)
+                    piece = board.get_piece(pos)
+                    if piece.color == color:
+                        moves = board.get_valid_moves(pos)
+                        if moves:
+                            has_valid_moves = True
+                            break
+                if has_valid_moves:
+                    break
+            
+            if not has_valid_moves:
+                print(f"WARNING: No valid moves for {color}")
+                # Game should be over if there are no valid moves
+                raise ValueError(f"No valid moves for {color}")
+            
+            # Standard MCTS move selection
             moves, probabilities = self.mcts.get_move_probabilities(
                 board, temperature=self.config['temperature']
             )
+            search_time = time.time() - start_time
             
-            # Xử lý trường hợp không có nước đi
+            # Handle case with no valid moves
             if not moves or len(moves) == 0:
                 print("No valid moves returned by MCTS, using random move")
                 return self._random_move(board, color)
@@ -117,7 +158,7 @@ class AlphaZeroPlayer(TrainableChessAI):
             # Store the MCTS policy for training
             self.last_mcts_policy = {move: prob for move, prob in zip(moves, probabilities)}
             
-            # Kiểm tra tính hợp lệ của probabilities
+            # Check probabilities for validity
             if np.isnan(probabilities).any() or np.sum(probabilities) == 0:
                 print("Invalid probabilities, using uniform distribution")
                 probabilities = np.ones(len(moves)) / len(moves)
@@ -126,81 +167,14 @@ class AlphaZeroPlayer(TrainableChessAI):
             chosen_idx = np.random.choice(len(moves), p=probabilities)
             chosen_move = moves[chosen_idx]
             
-            # Update MCTS tree with the chosen move
-            try:
-                self.mcts.update_with_move(chosen_move)
-            except Exception as e:
-                print(f"Warning: Could not update MCTS tree: {e}")
             
             return chosen_move
             
         except Exception as e:
             print(f"Error in get_move: {e}")
+            traceback.print_exc()
             # Fallback to random move in case of error
-            print("Falling back to random move")
+            print("Falling back to random move due to error")
             return self._random_move(board, color)
-    
-    def record_game_result(self, result):
-        """
-        Record the result of a game for training data
         
-        Args:
-            result: Game result (1.0 for win, 0.0 for draw, -1.0 for loss)
-        """
-        if self.last_state and self.last_mcts_policy:
-            # Convert last_mcts_policy to the format expected by the training function
-            policy = np.zeros(1968)  # Policy vector size
-            for (from_pos, to_pos), prob in self.last_mcts_policy.items():
-                move_key = (from_pos.row, from_pos.col, to_pos.row, to_pos.col)
-                if move_key in self.encoder.move_to_index:
-                    idx = self.encoder.move_to_index[move_key]
-                    policy[idx] = prob
-            
-            # Encode the board
-            encoded_state = self.encoder.encode_board(self.last_state, self.board_history)
-            
-            # Add the training example
-            self.self_play_data.append({
-                'state': encoded_state,
-                'policy': policy,
-                'value': result
-            })
-            
-            # Clear last state and policy
-            self.last_state = None
-            self.last_mcts_policy = None
-    
-    def save_model(self, filepath):
-        """
-        Save the model to a file
         
-        Args:
-            filepath: Path to save the model
-        """
-        torch.save({
-            'model_state_dict': self.network.state_dict(),
-            'config': self.config
-        }, filepath)
-    
-    def load_model(self, filepath):
-        """
-        Load a model from a file
-        
-        Args:
-            filepath: Path to the model file
-        """
-        checkpoint = torch.load(filepath)
-        self.network.load_state_dict(checkpoint['model_state_dict'])
-        if 'config' in checkpoint:
-            # Update only the network-related config parameters
-            for key in ['num_res_blocks', 'num_filters']:
-                if key in checkpoint['config']:
-                    self.config[key] = checkpoint['config'][key]
-        
-        # Reset MCTS after loading new model
-        self.mcts = AlphaZeroMCTS(
-            network=self.network,
-            encoder=self.encoder,
-            num_simulations=self.config['num_simulations'],
-            c_puct=self.config['c_puct']
-        )
