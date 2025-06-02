@@ -36,10 +36,19 @@ class AlphaZeroPlayer(TrainableChessAI):
         # Initialize base class
         super().__init__(exploration_rate=self.config['exploration_rate'])
         
-        # Set device
-        if self.config['use_cuda'] and torch.cuda.is_available():
+        # Đảm bảo rõ ràng GPU được sử dụng nếu có thể
+        if torch.cuda.is_available():
+            # Thiết lập CUDA device một cách rõ ràng
+            torch.cuda.set_device(0)
             self.device = torch.device("cuda")
             print(f"AlphaZero player using CUDA: {torch.cuda.get_device_name(0)}")
+            # Hiển thị thông tin GPU
+            print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+            # Khởi tạo GPU với một tensor nhỏ để đảm bảo các tính toán diễn ra trên GPU
+            warm_up = torch.ones(1, device=self.device)
+            warm_up = warm_up * 2
+            torch.cuda.synchronize()  # Đảm bảo xử lý xong
+            del warm_up  # Giải phóng bộ nhớ
         else:
             self.device = torch.device("cpu")
             print("AlphaZero player using CPU")
@@ -64,12 +73,13 @@ class AlphaZeroPlayer(TrainableChessAI):
         # Initialize encoder
         self.encoder = ChessEncoder()
         
-        # Initialize MCTS
+        # Initialize MCTS with the same device as network
         self.mcts = AlphaZeroMCTS(
             network=self.network,
             encoder=self.encoder,
             num_simulations=self.config['num_simulations'],
-            c_puct=self.config['c_puct']
+            c_puct=self.config['c_puct'],
+            device=self.device  # Đảm bảo MCTS sử dụng cùng device với network
         )
         
         # Storage for self-play data
@@ -77,11 +87,18 @@ class AlphaZeroPlayer(TrainableChessAI):
         self.last_state = None
         self.board_history = []
         
-        # Test model with a simple input
+        # Test model với input đơn giản và hiển thị thông tin về device
         try:
             test_input = np.zeros((119, 8, 8), dtype=np.float32)
+            start_time = time.time()
             policy, value = self.network.predict(test_input)
+            inference_time = time.time() - start_time
             print(f"Neural network initialized: policy shape={policy.shape}, value={value}")
+            print(f"Test inference time: {inference_time*1000:.2f}ms")
+            
+            # Kiểm tra GPU usage sau khi dự đoán
+            if torch.cuda.is_available():
+                print(f"GPU memory used: {torch.cuda.memory_allocated(0)/1024**2:.2f} MB")
         except Exception as e:
             print(f"Warning: Neural network test failed: {e}")
             traceback.print_exc()
@@ -122,6 +139,12 @@ class AlphaZeroPlayer(TrainableChessAI):
             # Reset MCTS tree for each move
             self.mcts.root = None
             
+            # Monitor GPU memory trước khi bắt đầu
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()  # Đảm bảo mọi hoạt động GPU đã hoàn tất
+                mem_before = torch.cuda.memory_allocated(0)
+                print(f"GPU memory before MCTS: {mem_before/1024**2:.2f} MB")
+            
             # Run MCTS simulations to get move probabilities
             start_time = time.time()
             
@@ -144,11 +167,19 @@ class AlphaZeroPlayer(TrainableChessAI):
                 # Game should be over if there are no valid moves
                 raise ValueError(f"No valid moves for {color}")
             
-            # Standard MCTS move selection
+            # Standard MCTS move selection - show statistics
             moves, probabilities = self.mcts.get_move_probabilities(
-                board, temperature=self.config['temperature']
+                board, temperature=self.config['temperature'], show_stats=True
             )
             search_time = time.time() - start_time
+            print(f"MCTS search time: {search_time:.2f}s for {self.config['num_simulations']} simulations")
+            
+            # Monitor GPU memory sau MCTS
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                mem_after = torch.cuda.memory_allocated(0)
+                print(f"GPU memory after MCTS: {mem_after/1024**2:.2f} MB")
+                print(f"GPU memory change: {(mem_after-mem_before)/1024**2:.2f} MB")
             
             # Handle case with no valid moves
             if not moves or len(moves) == 0:
@@ -167,7 +198,10 @@ class AlphaZeroPlayer(TrainableChessAI):
             chosen_idx = np.random.choice(len(moves), p=probabilities)
             chosen_move = moves[chosen_idx]
             
-            
+            # Làm sạch bộ nhớ GPU sau mỗi move
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
             return chosen_move
             
         except Exception as e:
@@ -176,5 +210,26 @@ class AlphaZeroPlayer(TrainableChessAI):
             # Fallback to random move in case of error
             print("Falling back to random move due to error")
             return self._random_move(board, color)
-        
-        
+    
+    def load_model(self, filepath):
+        """Load model from file"""
+        try:
+            if not os.path.exists(filepath):
+                print(f"Model file not found: {filepath}")
+                return False
+
+            iteration, _ = self.network.load_checkpoint(filepath)
+            print(f"Model loaded from {filepath} (iteration {iteration})")
+            
+            # Đảm bảo model ở đúng device
+            self.network.to(self.device)
+            
+            # Kiểm tra model device
+            print(f"Model device after loading: {next(self.network.parameters()).device}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            traceback.print_exc()
+            return False
