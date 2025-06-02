@@ -122,7 +122,6 @@ class AlphaZeroMCTS:
     def search(self, board: ChessBoard, num_simulations: int, 
                temperature: float = 1.0, add_noise: bool = False) -> Tuple[np.ndarray, float]:
         """Optimized MCTS search with batched evaluation"""
-        print(f"Starting fast MCTS search with {num_simulations} simulations")
         root = MCTSNode(board)
         
         # Process simulations in batches
@@ -134,11 +133,6 @@ class AlphaZeroMCTS:
             self._simulate_batch(root, current_batch_size)
             completed_sims += current_batch_size
             
-            if completed_sims % 100 == 0:
-                print(f"Completed {completed_sims}/{num_simulations} simulations")
-        
-        print(f"Completed {completed_sims} simulations")
-        
         # Add Dirichlet noise
         if add_noise and root.is_expanded and root.children:
             self._add_dirichlet_noise(root)
