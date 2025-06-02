@@ -229,13 +229,7 @@ class AlphaZeroMCTS:
                 top_moves = sorted(zip(moves, visit_counts), key=lambda x: x[1], reverse=True)[:5]
             else:
                 print("WARNING: No moves found after simulations")
-            # Add Dirichlet noise at root node for exploration (only during training)
-            if add_exploration_noise and moves:
-                noise = np.random.dirichlet([0.3] * len(moves))
-                for i, (move, child) in enumerate(self.root.children.items()):
-                    child.prior_p = 0.75 * child.prior_p + 0.25 * noise[i]
 
-            
             # If no moves found, fall back to all valid moves with uniform distribution
             if not moves:
                 valid_moves = []
