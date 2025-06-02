@@ -3,8 +3,21 @@ import argparse
 import torch
 from alpha_zero_trainer import AlphaZeroTrainer
 from alphazero_config import load_config
+from GPU_utils import force_cuda_device_init, print_gpu_utilization
 
 def main():
+    # Khởi tạo GPU
+    if force_cuda_device_init():
+        print("GPU initialized successfully")
+    else:
+        print("Failed to initialize GPU or GPU not available")
+
+    # Kiểm tra GPU usage ban đầu
+    print_gpu_utilization()
+
+    # Đặt biến môi trường để ép buộc sử dụng CUDA
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    
     parser = argparse.ArgumentParser(description="AlphaZero Chess Training with CUDA Support")
     parser.add_argument("--config", type=str, help="Path to config file", default=None)
     parser.add_argument("--output_dir", type=str, help="Directory for output files", default="alphazero_models")
@@ -40,12 +53,20 @@ def main():
         'mixed_precision': not args.no_mixed_precision and torch.cuda.is_available(),
     })
     
-    # Log CUDA status
+    # Kiểm tra và thiết lập CUDA explicitly
     if config['use_cuda']:
         print(f"CUDA available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
-            print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
+            torch.cuda.set_device(0)  # Thiết lập device cụ thể
+            print(f"CUDA Device explicitly set to: {torch.cuda.current_device()}")
+            print(f"CUDA Device name: {torch.cuda.get_device_name(0)}")
             print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+            
+            # Kiểm tra xem CUDA có thực sự hoạt động không
+            test_tensor = torch.ones(1).cuda()
+            print(f"Test tensor device: {test_tensor.device}")
+            del test_tensor  # Giải phóng bộ nhớ
+            torch.cuda.empty_cache()
     else:
         print("Running on CPU only")
 

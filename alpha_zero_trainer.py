@@ -278,67 +278,42 @@ class AlphaZeroTrainer:
         
         print(f"Self-play completed with {len(all_examples)} training examples")
         return all_examples
-    
+
     def train_network(self, examples):
-        """
-        Train the neural network on examples
+        """Train the neural network using examples from the replay buffer"""
+        # Theo dõi GPU sử dụng nếu có
+        if self.config['use_cuda'] and torch.cuda.is_available():
+            print(f"GPU usage before training:")
+            print(f"- Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+            print(f"- Cached: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
         
-        Args:
-            examples: List of self-play examples
-            
-        Returns:
-            Training loss
-        """
-        print("\nTraining neural network...")
+        # Create dataset and data loader
+        states, policies, values = self._prepare_examples(examples)
         
-        # Prepare dataset and dataloader
-        dataset = SelfPlayDataset(examples)
-        dataloader = DataLoader(
-            dataset, 
-            batch_size=self.config['batch_size'],
-            shuffle=True,
-            num_workers=self.config['num_workers'],
-            pin_memory=self.config['pin_memory']
-        )
+        # Đảm bảo các tensor được đưa lên GPU
+        states = torch.FloatTensor(states).to(self.device)
+        policies = torch.FloatTensor(policies).to(self.device)
+        values = torch.FloatTensor(values).unsqueeze(1).to(self.device)
         
-        # Set network to training mode
-        self.network.train()
+        print(f"Training data device: {states.device}")
         
-        # Create learning rate scheduler
-        if self.config['scheduler'] == 'cosine':
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, 
-                T_max=self.config['epochs']
-            )
-        elif self.config['scheduler'] == 'step':
-            scheduler = torch.optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=10,
-                gamma=0.1
-            )
-        else:
-            scheduler = None
+        # Initialize loss tracking
+        epoch_loss = 0
+        epoch_policy_loss = 0
+        epoch_value_loss = 0
         
-        # Train the network for multiple epochs
-        total_loss = 0
-        total_policy_loss = 0
-        total_value_loss = 0
-        batch_count = 0
-        
-        # Create progress bar for epochs
+        # Train for the specified number of epochs
         for epoch in range(self.config['epochs']):
-            epoch_loss = 0
-            epoch_policy_loss = 0
-            epoch_value_loss = 0
-            epoch_batches = 0
+            # Shuffle the data for each epoch
+            permutation = torch.randperm(states.size(0))
             
-            # Create progress bar for batches
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.config['epochs']}")
-            for states, policies, values in pbar:
-                # Move data to device and convert types
-                states = states.float().to(self.device)
-                policies = policies.float().to(self.device)
-                values = values.float().unsqueeze(1).to(self.device)  # Add batch dimension
+            # Process batches
+            batch_count = 0
+            for i in range(0, states.size(0), self.config['batch_size']):
+                indices = permutation[i:i + self.config['batch_size']]
+                batch_states = states[indices]
+                batch_policies = policies[indices]
+                batch_values = values[indices]
                 
                 # Zero gradients
                 self.optimizer.zero_grad()
@@ -347,11 +322,11 @@ class AlphaZeroTrainer:
                 if self.config['mixed_precision']:
                     with torch.cuda.amp.autocast():
                         # Forward pass
-                        policy_logits, value_pred = self.network(states)
+                        policy_logits, value_pred = self.network(batch_states)
                         
                         # Calculate loss components
-                        policy_loss = -torch.mean(torch.sum(policies * F.log_softmax(policy_logits, dim=1), dim=1))
-                        value_loss = F.mse_loss(value_pred, values)
+                        policy_loss = -torch.mean(torch.sum(batch_policies * F.log_softmax(policy_logits, dim=1), dim=1))
+                        value_loss = F.mse_loss(value_pred, batch_values)
                         
                         # Total loss (weighted sum of policy and value losses)
                         loss = policy_loss + value_loss
@@ -363,56 +338,40 @@ class AlphaZeroTrainer:
                 else:
                     # Standard precision training
                     # Forward pass
-                    policy_logits, value_pred = self.network(states)
+                    policy_logits, value_pred = self.network(batch_states)
                     
                     # Calculate loss components
-                    policy_loss = -torch.mean(torch.sum(policies * F.log_softmax(policy_logits, dim=1), dim=1))
-                    value_loss = F.mse_loss(value_pred, values)
+                    policy_loss = -torch.mean(torch.sum(batch_policies * F.log_softmax(policy_logits, dim=1), dim=1))
+                    value_loss = F.mse_loss(value_pred, batch_values)
                     
-                    # Total loss (weighted sum of policy and value losses)
+                    # Total loss
                     loss = policy_loss + value_loss
                     
                     # Backward pass
                     loss.backward()
                     self.optimizer.step()
                 
-                # Update statistics
+                # Accumulate loss statistics
                 epoch_loss += loss.item()
                 epoch_policy_loss += policy_loss.item()
                 epoch_value_loss += value_loss.item()
-                epoch_batches += 1
-                
-                # Update progress bar
-                pbar.set_postfix({
-                    'loss': epoch_loss / epoch_batches,
-                    'policy': epoch_policy_loss / epoch_batches,
-                    'value': epoch_value_loss / epoch_batches
-                })
+                batch_count += 1
             
-            # Update scheduler
-            if scheduler:
-                scheduler.step()
-            
-            # Update total statistics
-            avg_epoch_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0
-            avg_epoch_policy_loss = epoch_policy_loss / epoch_batches if epoch_batches > 0 else 0
-            avg_epoch_value_loss = epoch_value_loss / epoch_batches if epoch_batches > 0 else 0
-            
-            print(f"Epoch {epoch+1}/{self.config['epochs']}, "
-                  f"Loss: {avg_epoch_loss:.4f}, "
-                  f"Policy: {avg_epoch_policy_loss:.4f}, "
-                  f"Value: {avg_epoch_value_loss:.4f}")
-            
-            total_loss += avg_epoch_loss
-            total_policy_loss += avg_epoch_policy_loss
-            total_value_loss += avg_epoch_value_loss
-            batch_count += 1
+            # Clear CUDA cache sau mỗi epoch
+            if self.config['use_cuda'] and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        # Return average losses across all epochs
+        # Theo dõi GPU sử dụng sau khi train
+        if self.config['use_cuda'] and torch.cuda.is_available():
+            print(f"GPU usage after training:")
+            print(f"- Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+            print(f"- Cached: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
+        
+        # Return the average losses over the epoch
         return {
-            'loss': total_loss / self.config['epochs'],
-            'policy_loss': total_policy_loss / self.config['epochs'],
-            'value_loss': total_value_loss / self.config['epochs']
+            'loss': epoch_loss / (batch_count * self.config['epochs']),
+            'policy_loss': epoch_policy_loss / (batch_count * self.config['epochs']),
+            'value_loss': epoch_value_loss / (batch_count * self.config['epochs'])
         }
     
     def evaluate(self):

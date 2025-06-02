@@ -33,7 +33,7 @@ class AlphaZeroNetwork(nn.Module):
         """
         super(AlphaZeroNetwork, self).__init__()
         
-        # Set device (GPU/CPU)
+        # Set device (GPU/CPU) - Đảm bảo sử dụng GPU nếu có
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"AlphaZero network initialized on: {self.device}")
 
@@ -57,11 +57,21 @@ class AlphaZeroNetwork(nn.Module):
         self.value_fc1 = nn.Linear(8 * 8, 256)
         self.value_fc2 = nn.Linear(256, 1)
         
-        # Move model to device
+        # Kiểm tra trước khi chuyển model sang device
+        print(f"Moving model to device: {self.device}")
+        
+        # Di chuyển model sang device
         self.to(self.device)
+        
+        # Xác minh model đã được chuyển đúng sang device
+        print(f"Model device after moving: {next(self.parameters()).device}")
 
     def forward(self, x):
         """Forward pass through the network"""
+        # Đảm bảo input ở đúng device
+        if x.device != self.device:
+            x = x.to(self.device)
+            
         # Input layer
         x = F.relu(self.bn_input(self.conv_input(x)))
         
@@ -131,7 +141,7 @@ class AlphaZeroNetwork(nn.Module):
         
         if optimizer is not None and 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            # Move optimizer state to correct device
+            # Di chuyển trạng thái optimizer sang đúng device
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor):
