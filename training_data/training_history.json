@@ -1,0 +1,12 @@
+[
+  {
+    "iteration": 0,
+    "train_loss": 0.0,
+    "buffer_size": 0
+  },
+  {
+    "iteration": 1,
+    "train_loss": 0.0,
+    "buffer_size": 0
+  }
+]
