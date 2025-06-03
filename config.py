@@ -50,3 +50,8 @@ class AlphaZeroConfig:
     batch_mcts: bool = True 
     use_cache: bool = True  
     memory_efficient: bool = True
+    
+    # GPU parallel settings
+    use_gpu_parallel: bool = False
+    parallel_games: int = 4
+    mcts_batch_size: int = 32

@@ -1,12 +1,9 @@
 [
   {
     "iteration": 0,
-    "train_loss": 0.0,
-    "buffer_size": 0
-  },
-  {
-    "iteration": 1,
-    "train_loss": 0.0,
-    "buffer_size": 0
+    "examples_generated": 9819,
+    "replay_buffer_size": 9819,
+    "avg_loss": 8.370598751306535,
+    "time_seconds": 311.0401916503906
   }
 ]

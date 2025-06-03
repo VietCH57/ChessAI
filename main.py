@@ -3,6 +3,7 @@ import torch
 import os
 import psutil
 import time
+import math
 from config import AlphaZeroConfig
 from trainer import AlphaZeroTrainer
 
@@ -18,6 +19,67 @@ if USE_TPU:
     except ImportError:
         print("PyTorch XLA not available. Install with: pip install torch_xla")
         USE_TPU = False
+
+def get_optimal_gpu_settings():
+    """Determine optimal settings based on GPU capabilities"""
+    try:
+        if not torch.cuda.is_available():
+            return {}
+            
+        # Get GPU information
+        device_props = torch.cuda.get_device_properties(0)
+        gpu_name = device_props.name
+        gpu_mem_gb = device_props.total_memory / 1e9  # GB
+        compute_capability = f"{device_props.major}.{device_props.minor}"
+        cuda_cores = 0
+        
+        # Estimate CUDA cores based on compute capability
+        if device_props.major == 8:  # Ampere (RTX 30xx)
+            cuda_cores = device_props.multi_processor_count * 128
+        elif device_props.major == 7:  # Volta/Turing (RTX 20xx, GTX 16xx)
+            cuda_cores = device_props.multi_processor_count * 64
+        elif device_props.major == 6:  # Pascal (GTX 10xx)
+            cuda_cores = device_props.multi_processor_count * 128
+        else:  # Older architectures
+            cuda_cores = device_props.multi_processor_count * 64
+            
+        print(f"GPU: {gpu_name}, Memory: {gpu_mem_gb:.1f}GB, Compute: {compute_capability}, CUDA Cores: {cuda_cores}")
+        
+        # Calculate optimal parallel games based on GPU memory and cores
+        # Each game roughly needs ~200MB for network + MCTS
+        max_parallel_by_mem = math.floor(gpu_mem_gb * 0.7 / 0.2)  # Use 70% of memory
+        max_parallel_by_cores = math.ceil(cuda_cores / 128)  # Heuristic based on cores
+        
+        optimal_parallel_games = min(max(2, min(max_parallel_by_mem, max_parallel_by_cores)), 16)
+        
+        # Set network size based on memory
+        if gpu_mem_gb < 4:  # Low memory GPU
+            network_size = "small"  # 6 blocks, 64 filters
+            optimal_batch_size = 32
+            mcts_batch_size = 16
+        elif gpu_mem_gb < 8:  # Mid-range GPU 
+            network_size = "medium"  # 12 blocks, 128 filters
+            optimal_batch_size = 64
+            mcts_batch_size = 32
+        else:  # High-end GPU
+            network_size = "large"  # 19+ blocks, 256 filters
+            optimal_batch_size = 128
+            mcts_batch_size = 64
+            
+        # Tensor cores available on Volta (7.0), Turing (7.5), Ampere (8.0+)
+        has_tensor_cores = device_props.major >= 7
+        
+        return {
+            "parallel_games": optimal_parallel_games,
+            "network_size": network_size,
+            "batch_size": optimal_batch_size,
+            "mcts_batch_size": mcts_batch_size,
+            "use_mixed_precision": has_tensor_cores,
+            "gpu_mem_gb": gpu_mem_gb
+        }
+    except Exception as e:
+        print(f"Error determining GPU settings: {e}")
+        return {}
 
 def main():
     parser = argparse.ArgumentParser(description='AlphaZero Chess Training')
@@ -46,6 +108,10 @@ def main():
     parser.add_argument('--half-precision', action='store_true', help='Use half precision (FP16)')
     parser.add_argument('--batch-mcts', action='store_true', help='Use batched MCTS evaluation')
     parser.add_argument('--use-cache', action='store_true', help='Use board evaluation cache')
+    parser.add_argument('--parallel-games', type=int, default=0, 
+                       help='Number of parallel games to run on GPU (0=auto)')
+    parser.add_argument('--mcts-batch-size', type=int, default=0,
+                       help='Batch size for MCTS evaluations (0=auto)')
     
     args = parser.parse_args()
     
@@ -60,6 +126,26 @@ def main():
     else:
         device = args.device
     
+    # Get GPU-specific optimizations if using CUDA
+    gpu_settings = {}
+    if device == 'cuda' and torch.cuda.is_available():
+        gpu_settings = get_optimal_gpu_settings()
+        print(f"GPU optimization: {gpu_settings}")
+        
+        # Enable CUDA optimizations
+        if not args.disable_tree_reuse:
+            print("Enabling MCTS tree reuse for GPU")
+        
+        # Activate tensor cores if available
+        if gpu_settings.get("use_mixed_precision", False) and not args.half_precision:
+            print("GPU supports tensor cores - enabling mixed precision by default")
+            args.half_precision = True
+            
+        # Force batched MCTS for GPU
+        if not args.batch_mcts:
+            print("Enabling batched MCTS for GPU")
+            args.batch_mcts = True
+    
     # Configure optimal batch size
     if device == 'tpu':
         # TPU typically works well with larger batch sizes
@@ -69,40 +155,44 @@ def main():
         optimal_blocks = 20    # More blocks for better model capacity
         optimal_workers = 0    # TPU requires num_workers=0
         print(f"TPU mode: Using {args.tpu_cores} cores with batch size {optimal_batch_size}")
+        use_gpu_parallel = False
+        parallel_games = 0
+        mcts_batch_size = 1
     elif device == 'cuda' and torch.cuda.is_available():
         # GPU settings
-        try:
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
-            if gpu_mem < 6:  # Low memory GPU (< 6GB)
-                optimal_batch_size = min(32, args.batch_size)
-                optimal_filters = min(64, args.filters)
-                optimal_blocks = min(6, args.residual_blocks)
-            elif gpu_mem < 11:  # Mid-range GPU (6-11GB)
-                optimal_batch_size = min(64, args.batch_size)
-                optimal_filters = min(128, args.filters)
-                optimal_blocks = min(12, args.residual_blocks)
-            else:  # High-end GPU (>11GB)
-                optimal_batch_size = min(128, args.batch_size)
-                optimal_filters = args.filters
-                optimal_blocks = args.residual_blocks
-                
-            print(f"GPU Memory: {gpu_mem:.1f}GB, Optimized batch size: {optimal_batch_size}")
+        network_size = gpu_settings.get("network_size", "medium")
+        
+        if network_size == "small":
+            optimal_filters = min(64, args.filters)
+            optimal_blocks = min(6, args.residual_blocks)
+        elif network_size == "medium":
+            optimal_filters = min(128, args.filters)
+            optimal_blocks = min(12, args.residual_blocks)
+        else:  # large
+            optimal_filters = min(256, args.filters) 
+            optimal_blocks = min(19, args.residual_blocks)
             
-            # Optimize workers for GPU
-            logical_cores = psutil.cpu_count(logical=True) or 4
-            optimal_workers = min(args.workers, max(2, logical_cores // 2))
-        except Exception as e:
-            print(f"Error detecting GPU specs: {e}, using default parameters")
-            optimal_batch_size = args.batch_size
-            optimal_filters = args.filters
-            optimal_blocks = args.residual_blocks
-            optimal_workers = args.workers
+        optimal_batch_size = gpu_settings.get("batch_size", args.batch_size)
+        
+        # Set up GPU parallel parameters
+        use_gpu_parallel = True
+        parallel_games = args.parallel_games if args.parallel_games > 0 else gpu_settings.get("parallel_games", 4)
+        mcts_batch_size = args.mcts_batch_size if args.mcts_batch_size > 0 else gpu_settings.get("mcts_batch_size", 32)
+        
+        print(f"GPU mode: Using {parallel_games} parallel games with MCTS batch size {mcts_batch_size}")
+        
+        # Optimize workers for GPU
+        logical_cores = psutil.cpu_count(logical=True) or 4
+        optimal_workers = min(args.workers, max(2, logical_cores // 2))
     else:
         # CPU mode
         print("Running on CPU. Consider using GPU for faster training.")
         optimal_batch_size = min(args.batch_size, 16)  # Smaller batches on CPU
         optimal_filters = min(args.filters, 64)        # Smaller network on CPU
         optimal_blocks = min(args.residual_blocks, 6)  # Fewer blocks on CPU
+        use_gpu_parallel = False
+        parallel_games = 0
+        mcts_batch_size = 1
         
         # Optimize workers for CPU
         physical_cores = psutil.cpu_count(logical=False) or 2
@@ -131,7 +221,12 @@ def main():
         half_precision=args.half_precision,
         batch_mcts=args.batch_mcts,
         use_cache=args.use_cache,
-        memory_efficient=memory_efficient
+        memory_efficient=memory_efficient,
+        
+        # GPU parallel settings
+        use_gpu_parallel=use_gpu_parallel,
+        parallel_games=parallel_games,
+        mcts_batch_size=mcts_batch_size
     )
     
     print("\nAlphaZero Chess Training")
@@ -142,6 +237,7 @@ def main():
     print(f"MCTS simulations: {config.num_simulations}")
     print(f"Network: {config.num_residual_blocks} blocks, {config.num_filters} filters")
     print(f"Optimizations: JIT={config.use_jit}, FP16={config.half_precision}, Tree reuse={config.tree_reuse}")
+    print(f"GPU acceleration: {config.use_gpu_parallel}, Parallel games: {config.parallel_games}")
     print(f"Memory efficient: {config.memory_efficient}, Batch MCTS: {config.batch_mcts}")
     print("=" * 50)
     

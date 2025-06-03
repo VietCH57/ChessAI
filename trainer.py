@@ -1,19 +1,41 @@
-import os
-import json
-import pickle
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+import numpy as np
+import random
+import os
+import time
+import json
+import traceback
+from collections import deque
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Dict, Any, Tuple
 from collections import deque
 import random
 import time
 from datetime import datetime, timedelta
+from mcts import AlphaZeroMCTS, BatchedMCTS
+from selfplay import SelfPlayGenerator, AlphaZeroAI, GPUParallelSelfPlayGenerator
 
-# TPU imports - kiểm tra và import nếu có thể
+# Enhanced CUDA configuration
 USE_TPU = os.environ.get('COLAB_TPU_ADDR') is not None
+USE_CUDA = torch.cuda.is_available()
+
+if USE_CUDA:
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere GPUs
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Set memory allocation to avoid fragmentation
+    if hasattr(torch.cuda, 'memory_stats'):
+        print(f"CUDA available: {torch.cuda.device_count()} devices")
+        print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.1f} MB")
+    
+    # Try to ensure CUDA operations are asynchronous when possible
+    torch.cuda.set_device(0)  # Set default device
+
 if USE_TPU:
     try:
         import torch_xla
@@ -30,22 +52,64 @@ from selfplay import SelfPlayGenerator, AlphaZeroAI
 from headless import HeadlessChessGame
 
 class AlphaZeroDataset(Dataset):
-    """Dataset for AlphaZero training with batching optimizations"""
+    """Dataset for AlphaZero training with GPU optimizations"""
     
-    def __init__(self, training_examples: List[Dict[str, Any]]):
+    def __init__(self, training_examples: List[Dict[str, Any]], device=None):
         self.examples = training_examples
+        self.device = device
+        
+        # Pre-process data in batches for faster GPU loading
+        if len(training_examples) > 0 and device is not None and device.type == 'cuda':
+            self.pre_process()
+    
+    def pre_process(self):
+        """Pre-process data in batches to GPU for faster loading"""
+        # Maximum batch size for pre-processing
+        batch_size = 1024
+        
+        # Process data in batches to avoid memory issues
+        for start_idx in range(0, len(self.examples), batch_size):
+            end_idx = min(start_idx + batch_size, len(self.examples))
+            batch = self.examples[start_idx:end_idx]
+            
+            # Convert to tensors and move to device
+            states = torch.stack([torch.FloatTensor(ex['state']) for ex in batch])
+            policies = torch.stack([torch.FloatTensor(ex['policy']) for ex in batch])
+            outcomes = torch.FloatTensor([ex['outcome'] for ex in batch]).unsqueeze(1)
+            
+            # Move to device
+            if self.device.type == 'cuda':
+                states = states.pin_memory()
+                policies = policies.pin_memory()
+                outcomes = outcomes.pin_memory()
+            
+            # Update examples with pre-processed tensors
+            for i, idx in enumerate(range(start_idx, end_idx)):
+                self.examples[idx]['state_tensor'] = states[i]
+                self.examples[idx]['policy_tensor'] = policies[i]
+                self.examples[idx]['outcome_tensor'] = outcomes[i]
     
     def __len__(self):
         return len(self.examples)
     
     def __getitem__(self, idx):
         example = self.examples[idx]
+        
+        # Use pre-processed tensors if available
+        if 'state_tensor' in example:
+            return (
+                example['state_tensor'],
+                example['policy_tensor'],
+                example['outcome_tensor']
+            )
+        
+        # Otherwise convert on-the-fly
         return (
             torch.FloatTensor(example['state']),
             torch.FloatTensor(example['policy']),
             torch.FloatTensor([example['outcome']])
         )
-
+                 
 class AlphaZeroTrainer:
     """Main AlphaZero training pipeline with optimizations"""
     
@@ -63,16 +127,32 @@ class AlphaZeroTrainer:
             weight_decay=config.weight_decay
         )
         
-        # Move network to correct device - with TPU support
+        # CUDA configuration and optimization
         if USE_TPU:
             self.device = xm.xla_device()
             print(f"Using TPU device: {self.device}")
         else:
-            self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+            if USE_CUDA:
+                # Set up CUDA device with optimizations
+                torch.cuda.empty_cache()
+                
+                # Get GPU device properties
+                device_id = 0
+                device_props = torch.cuda.get_device_properties(device_id)
+                print(f"Using GPU: {device_props.name} with {device_props.total_memory/1024**2:.0f}MB memory")
+                
+                # Set memory allocation strategy for MCTS
+                if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+                    # Reserve memory for MCTS batch inference
+                    torch.cuda.set_per_process_memory_fraction(0.8, device_id)
+                
+                self.device = torch.device(f"cuda:{device_id}")
+            else:
+                self.device = torch.device("cpu")
         
         self.network = self.network.to(self.device)
         
-        # Enable cuDNN benchmarking for faster training (only for GPU)
+        # Enable cuDNN benchmarking for faster training
         if self.device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
             
@@ -80,8 +160,14 @@ class AlphaZeroTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=3)
         
-        # Training components
-        self.selfplay_generator = SelfPlayGenerator(self.network, config)
+        # Configure selfplay with CUDA optimizations
+        self.selfplay_generator = SelfPlayGenerator(
+            self.network, 
+            config,
+            device=self.device,
+            use_cuda_mcts=self.device.type == 'cuda'  # Enable CUDA MCTS
+        )
+        
         self.replay_buffer = deque(maxlen=config.replay_buffer_size)
         
         # Training stats
@@ -96,6 +182,10 @@ class AlphaZeroTrainer:
             
         # Data augmentation
         self.use_augmentation = True
+        
+        # For CUDA optimization, create a pool of inference batches
+        self.mcts_batch_size = 64 if self.device.type == 'cuda' else 1
+        print(f"MCTS batch size: {self.mcts_batch_size}")
         
     def setup_directories(self):
         """Create necessary directories"""
@@ -116,20 +206,54 @@ class AlphaZeroTrainer:
             # Generate self-play games
             print("Generating self-play games...")
             try:
-                if self.config.num_workers > 1 and hasattr(self.selfplay_generator, 'generate_games_parallel'):
-                    # Use parallel generation if available
+                # Use GPU parallel processing if on CUDA
+                if self.device.type == 'cuda' and self.config.use_gpu_parallel:
+                    # Determine optimal parallel game count based on GPU memory
+                    try:
+                        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+                        # More conservative estimate based on available memory
+                        available_mem = (gpu_mem - (torch.cuda.memory_allocated(0) / 1024**3)) * 0.8  # 80% of available
+                        parallel_games = min(8, max(2, int(available_mem / 0.5)))  # ~500MB per game
+                        print(f"Available GPU memory: {available_mem:.1f}GB")
+                    except Exception as e:
+                        print(f"Error estimating memory: {e}")
+                        parallel_games = 2  # Conservative default
+                    
+                    print(f"Using GPU parallel mode with {parallel_games} simultaneous games")
+                    torch.cuda.empty_cache()  # Clear cache before starting
+                    
+                    # Make sure network is in eval mode for inference
+                    self.network.eval()
+                    
+                    gpu_generator = GPUParallelSelfPlayGenerator(
+                        self.network, 
+                        self.config, 
+                        device=self.device,
+                        num_parallel_games=parallel_games
+                    )
+                    training_examples = gpu_generator.generate_games(
+                        self.config.episodes_per_iteration
+                    )
+                elif self.config.num_workers > 1 and hasattr(self.selfplay_generator, 'generate_games_parallel'):
+                    # Use parallel CPU generation if not on CUDA
+                    print("Using CPU parallel mode")
                     training_examples = self.selfplay_generator.generate_games_parallel(
                         self.config.episodes_per_iteration,
                         num_processes=self.config.num_workers
                     )
                 else:
                     # Fallback to sequential generation
+                    print("Using sequential generation mode")
                     training_examples = self.selfplay_generator.generate_games(
                         self.config.episodes_per_iteration
                     )
+                    
+                # Switch back to training mode after generation
+                self.network.train()
+                
+                print(f"Generated {len(training_examples)} training examples")
             except Exception as e:
-                print(f"Error in parallel generation: {e}. Falling back to sequential mode.")
-                import traceback
+                print(f"Error in game generation: {e}. Falling back to sequential mode.")
                 traceback.print_exc()
                 # Emergency fallback
                 training_examples = self.selfplay_generator.generate_games(
@@ -145,80 +269,88 @@ class AlphaZeroTrainer:
             self.replay_buffer.extend(training_examples)
             print(f"Replay buffer size: {len(self.replay_buffer)}")
             
-            # Train network
-            print("Training network...")
-            train_loss = self.train_network()
+            # Train neural network
+            avg_loss = self.train_network()
             
-            # Evaluate new model
-            if iteration % self.config.checkpoint_interval == 0:
-                print("Evaluating model...")
+            # Evaluate model against previous best
+            if (iteration + 1) % self.config.checkpoint_interval == 0:
+                print("Evaluating model against previous best...")
                 win_rate = self.evaluate_model()
                 
-                # Save model if it's better
-                if win_rate > self.config.win_rate_threshold:
-                    print(f"New model wins {win_rate:.2%} - saving as best model")
+                # Save model if it's better than the previous best
+                if win_rate >= self.config.win_rate_threshold:
+                    print(f"New best model with win rate: {win_rate:.2%}")
                     self.save_model("best_model.pt")
-                else:
-                    print(f"New model wins {win_rate:.2%} - keeping old model")
-                    self.load_model("best_model.pt")
-            
-            # Save checkpoint
-            self.save_model(f"checkpoint_iter_{iteration}.pt")
-            self.save_model("last_checkpoint.pt")
-            
-            # Calculate iteration time
-            iter_time = time.time() - iter_start_time
-            
-            # Log progress
-            self.training_history.append({
+                
+                # Always save a checkpoint
+                self.save_model(f"checkpoint_{iteration + 1}.pt")
+                
+            # Record training stats
+            elapsed_time = time.time() - iter_start_time
+            stats = {
                 'iteration': iteration,
-                'train_loss': train_loss,
-                'buffer_size': len(self.replay_buffer),
-                'iter_time': iter_time,
-                'total_time': time.time() - self.start_time
-            })
+                'examples_generated': len(training_examples),
+                'replay_buffer_size': len(self.replay_buffer),
+                'avg_loss': avg_loss,
+                'time_seconds': elapsed_time
+            }
+            self.training_history.append(stats)
             
-            # Calculate and show ETA
-            avg_iter_time = iter_time
-            remaining_iters = self.config.num_iterations - (iteration + 1)
-            eta_seconds = avg_iter_time * remaining_iters
-            eta = timedelta(seconds=int(eta_seconds))
-            
-            print(f"Iteration {iteration + 1} completed in {iter_time/60:.1f}m")
-            print(f"Estimated time remaining: {eta}")
-            
+            # Save training history
             self.save_training_history()
             
-            # Update learning rate based on loss
-            self.scheduler.step(train_loss)
+            # Display progress
+            total_time = time.time() - self.start_time
+            examples_per_second = sum(stat['examples_generated'] for stat in self.training_history) / total_time
+            print(f"Iteration {iteration + 1} completed in {elapsed_time:.1f}s")
+            print(f"Total training time: {total_time/3600:.2f} hours")
+            print(f"Examples/second: {examples_per_second:.1f}")
+            print(f"Estimated completion: {(self.config.num_iterations - iteration - 1) * elapsed_time / 3600:.2f} hours")
     
     def train_network(self) -> float:
-        """Train the neural network with optimized data handling and TPU support"""
+        """Train the neural network with GPU-optimized data handling"""
+        print(f"Starting network training with {len(self.replay_buffer)} examples in replay buffer")
+        
         if len(self.replay_buffer) < self.config.batch_size:
+            print("Not enough examples for training")
             return 0.0
         
         # Sample training data
-        num_samples = min(len(self.replay_buffer), 2048)  # Limit to reasonable amount
+        num_samples = min(len(self.replay_buffer), 8192)  # Increased batch size for GPU
         batch_examples = random.sample(list(self.replay_buffer), num_samples)
+        print(f"Sampled {len(batch_examples)} examples for training")
         
-        # Data augmentation
+        # Log example structure for debugging
+        print(f"Example structure: {list(batch_examples[0].keys())}")
+        print(f"State shape: {batch_examples[0]['state'].shape}")
+        print(f"Policy shape: {batch_examples[0]['policy'].shape}")
+        
+        # Data augmentation on GPU if possible
         if self.use_augmentation:
-            augmented_examples = self._augment_training_data(batch_examples)
+            if self.device.type == 'cuda':
+                print("Performing GPU-accelerated data augmentation...")
+                augmented_examples = self._augment_training_data_gpu(batch_examples)
+            else:
+                print("Performing CPU data augmentation...")
+                augmented_examples = self._augment_training_data(batch_examples)
             batch_examples.extend(augmented_examples)
+            print(f"Data augmentation added {len(augmented_examples)} examples, total: {len(batch_examples)}")
         
-        # Create dataset and dataloader
-        dataset = AlphaZeroDataset(batch_examples)
+        # Create dataset and dataloader with device info
+        print("Creating dataset and dataloader...")
+        dataset = AlphaZeroDataset(batch_examples, device=self.device)
+        
+        # Configure dataloader for maximum GPU utilization
+        num_workers = 0 if USE_TPU else (0 if self.device.type == 'cuda' else 4)
         dataloader = DataLoader(
             dataset, 
             batch_size=self.config.batch_size, 
             shuffle=True, 
-            num_workers=0,  # TPU requires num_workers=0
-            pin_memory=True if self.device.type == 'cuda' else False
+            num_workers=num_workers,
+            pin_memory=self.device.type == 'cuda',
+            persistent_workers=False if USE_TPU else (num_workers > 0)
         )
-        
-        # Wrap dataloader with ParallelLoader for TPU
-        if USE_TPU:
-            dataloader = pl.ParallelLoader(dataloader, [self.device]).per_device_loader(self.device)
+        print(f"Created dataloader with {len(dataloader)} batches, batch size: {self.config.batch_size}")
         
         # Training loop
         self.network.train()
@@ -232,35 +364,69 @@ class AlphaZeroTrainer:
         # Number of epochs over the data
         num_epochs = 1
         
+        # Enable mixed precision training for faster computation on compatible GPUs
+        scaler = torch.cuda.amp.GradScaler() if self.device.type == 'cuda' else None
+        if scaler:
+            print("Using mixed precision training with gradient scaling")
+        
+        # Log current learning rate
+        current_lr = self.optimizer.param_groups[0]['lr']
+        print(f"Current learning rate: {current_lr}")
+        
+        # Track time for performance monitoring
+        start_time = time.time()
+        batch_start_time = start_time
+        
+        print("===== STARTING NETWORK TRAINING =====")
         for epoch in range(num_epochs):
-            for states, target_policies, target_values in dataloader:
+            print(f"Epoch {epoch+1}/{num_epochs}")
+            epoch_start_time = time.time()
+            
+            for batch_idx, (states, target_policies, target_values) in enumerate(dataloader):
+                # Log batch shapes for debugging
+                if batch_idx == 0:
+                    print(f"Batch tensor shapes - States: {states.shape}, Policies: {target_policies.shape}, Values: {target_values.shape}")
+                
                 # Move tensors to device - non_blocking for better performance
                 states = states.to(self.device, non_blocking=True)
                 target_policies = target_policies.to(self.device, non_blocking=True)
                 target_values = target_values.to(self.device, non_blocking=True)
                 
-                # Forward pass
-                policy_logits, predicted_values = self.network(states)
-                
-                # Calculate losses
-                value_loss = nn.MSELoss()(predicted_values.squeeze(), target_values.squeeze())
-                policy_loss = -torch.sum(target_policies * torch.log_softmax(policy_logits, dim=1)) / states.size(0)
-                
-                # Combined loss
-                total_loss_batch = value_loss + policy_loss
-                
-                # Backward pass with gradient clipping
+                # Forward pass with mixed precision
                 self.optimizer.zero_grad()
-                total_loss_batch.backward()
                 
-                # Clip gradients to prevent explosions
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
-                
-                # Optimizer step with TPU sync
-                if USE_TPU:
-                    xm.optimizer_step(self.optimizer)
-                    xm.mark_step()  # Important for TPU performance
+                if scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        # Forward pass
+                        policy_logits, value = self.network(states)
+                        
+                        # Calculate loss
+                        policy_loss = F.cross_entropy(policy_logits, target_policies)
+                        value_loss = F.mse_loss(value, target_values)
+                        total_loss_batch = policy_loss + value_loss
+                    
+                    # Backward pass with gradient scaling
+                    scaler.scale(total_loss_batch).backward()
+                    
+                    # Clip gradients to prevent explosions (with scaling)
+                    scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+                    
+                    # Update weights with scaling
+                    scaler.step(self.optimizer)
+                    scaler.update()
                 else:
+                    # Regular forward pass (no mixed precision)
+                    policy_logits, value = self.network(states)
+                    
+                    # Calculate loss
+                    policy_loss = F.cross_entropy(policy_logits, target_policies)
+                    value_loss = F.mse_loss(value, target_values)
+                    total_loss_batch = policy_loss + value_loss
+                    
+                    # Backward pass
+                    total_loss_batch.backward()
+                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
                     self.optimizer.step()
                 
                 # Track losses
@@ -268,67 +434,113 @@ class AlphaZeroTrainer:
                 policy_loss_sum += policy_loss.item()
                 value_loss_sum += value_loss.item()
                 num_batches += 1
+                
+                # Log every batch (was every 10)
+                batch_time = time.time() - batch_start_time
+                total_time = time.time() - start_time
+                examples_per_sec = (batch_idx + 1) * self.config.batch_size / total_time
+                
+                print(f"Batch {batch_idx+1}/{len(dataloader)} - Loss: {total_loss_batch.item():.4f} (P: {policy_loss.item():.4f}, V: {value_loss.item():.4f}) - {batch_time:.2f}s/batch, {examples_per_sec:.1f} ex/s")
+                
+                # GPU memory tracking
+                if self.device.type == 'cuda' and batch_idx % 5 == 0:
+                    mem_allocated = torch.cuda.memory_allocated() / 1024**2
+                    mem_reserved = torch.cuda.memory_reserved() / 1024**2
+                    print(f"GPU Memory: {mem_allocated:.1f}MB allocated, {mem_reserved:.1f}MB reserved")
+                
+                # Reset batch timer
+                batch_start_time = time.time()
+                
+                # GPU memory management - clear cache periodically
+                if self.device.type == 'cuda' and num_batches % 10 == 0:
+                    torch.cuda.empty_cache()
+            
+            # Epoch statistics
+            epoch_time = time.time() - epoch_start_time
+            print(f"Epoch {epoch+1} completed in {epoch_time:.2f}s")
         
         # Calculate average losses
         avg_loss = total_loss / max(num_batches, 1)
         avg_policy_loss = policy_loss_sum / max(num_batches, 1)
         avg_value_loss = value_loss_sum / max(num_batches, 1)
         
+        # Total training statistics
+        total_training_time = time.time() - start_time
+        print(f"===== TRAINING COMPLETE =====")
+        print(f"Total training time: {total_training_time:.2f}s")
         print(f"Training: Loss={avg_loss:.4f} (Policy={avg_policy_loss:.4f}, Value={avg_value_loss:.4f})")
+        print(f"Processed {num_batches} batches, {num_batches * self.config.batch_size} examples")
+        print(f"Speed: {num_batches * self.config.batch_size / total_training_time:.1f} examples/second")
+        
         return avg_loss
     
-    def _augment_training_data(self, examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Apply simple horizontal flip data augmentation"""
+    def _augment_training_data_gpu(self, examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply data augmentation directly on GPU for better performance"""
         augmented = []
         
         # Only augment a portion of the data
         num_to_augment = len(examples) // 4
-        for i in range(num_to_augment):
-            example = examples[i]
+        if num_to_augment == 0:
+            return augmented
             
-            # Create a copy for augmentation
-            new_example = {
-                'player': example['player'],
-                'move_count': example['move_count'],
-                'outcome': example['outcome']
-            }
+        # Convert states and policies to tensors for batch processing
+        states = torch.tensor(np.array([ex['state'] for ex in examples[:num_to_augment]]), 
+                            dtype=torch.float32, device=self.device)
+        policies = torch.tensor(np.array([ex['policy'] for ex in examples[:num_to_augment]]), 
+                                dtype=torch.float32, device=self.device)
+        
+        # Horizontal flip of board state (process in batch)
+        flipped_states = states.clone()
+        for plane_idx in range(states.shape[1]):
+            flipped_states[:, plane_idx] = torch.flip(states[:, plane_idx], dims=[2])
+        
+        # Horizontal flip of policy (process in batch)
+        flipped_policies = torch.zeros_like(policies)
+        batch_size = policies.shape[0]
+        
+        # Create mapping tensor for move indices
+        move_indices = torch.arange(0, 8*8*8*8, device=self.device).reshape(8, 8, 8, 8)
+        flipped_move_indices = torch.flip(move_indices, dims=[1, 3])
+        
+        # Map the policies using the flipped indices
+        for b in range(batch_size):
+            policy_flat = policies[b].reshape(8, 8, 8, 8)
+            flipped_policy_flat = torch.zeros_like(policy_flat)
             
-            # Horizontal flip of board state
-            state = example['state'].copy()
-            # Flip the board planes
-            for plane_idx in range(state.shape[0]):
-                state[plane_idx] = np.fliplr(state[plane_idx])
-            new_example['state'] = state
-            
-            # Horizontal flip of policy
-            policy = example['policy'].copy()
-            flipped_policy = np.zeros_like(policy)
-            
-            # Remap each move
             for from_row in range(8):
                 for from_col in range(8):
+                    flipped_from_col = 7 - from_col
                     for to_row in range(8):
                         for to_col in range(8):
-                            # Original move index
-                            orig_idx = from_row * 8 * 8 * 8 + from_col * 8 * 8 + to_row * 8 + to_col
-                            
-                            # Flipped move index (flip columns)
-                            flipped_from_col = 7 - from_col
                             flipped_to_col = 7 - to_col
-                            flipped_idx = from_row * 8 * 8 * 8 + flipped_from_col * 8 * 8 + to_row * 8 + flipped_to_col
-                            
-                            flipped_policy[flipped_idx] = policy[orig_idx]
+                            flipped_policy_flat[from_row, flipped_from_col, to_row, flipped_to_col] = policy_flat[from_row, from_col, to_row, to_col]
             
-            new_example['policy'] = flipped_policy
+            flipped_policies[b] = flipped_policy_flat.reshape(-1)
+        
+        # Move back to CPU and create new examples
+        flipped_states_cpu = flipped_states.cpu().numpy()
+        flipped_policies_cpu = flipped_policies.cpu().numpy()
+        
+        for i in range(num_to_augment):
+            new_example = {
+                'player': examples[i]['player'],
+                'move_count': examples[i]['move_count'],
+                'outcome': examples[i]['outcome'],
+                'state': flipped_states_cpu[i],
+                'policy': flipped_policies_cpu[i]
+            }
             augmented.append(new_example)
-            
+        
         return augmented
-    
+        
     def evaluate_model(self) -> float:
-        """Evaluate current model against previous best model"""
+        """Evaluate current model against previous best model with CUDA optimizations"""
         # Skip if no previous model
         if not os.path.exists(os.path.join(self.config.model_dir, "best_model.pt")):
+            print("No previous best model found, skipping evaluation")
             return 1.0
+        
+        print("Starting model evaluation against previous best")
         
         # Load previous best model
         prev_network = AlphaZeroNetwork(self.config)
@@ -337,9 +549,26 @@ class AlphaZeroTrainer:
         prev_model_path = os.path.join(self.config.model_dir, "best_model.pt")
         prev_network.load_state_dict(torch.load(prev_model_path, map_location=self.device))
         
-        # Create AIs
-        current_ai = AlphaZeroAI(self.network, self.config, training_mode=False)
-        previous_ai = AlphaZeroAI(prev_network, self.config, training_mode=False)
+        # Enable eval mode to optimize inference
+        self.network.eval()
+        prev_network.eval()
+        
+        # Create AIs with CUDA optimization flags
+        current_ai = AlphaZeroAI(
+            self.network, 
+            self.config, 
+            training_mode=False,
+            device=self.device,
+            batch_size=self.mcts_batch_size if self.device.type == 'cuda' else 1
+        )
+        
+        previous_ai = AlphaZeroAI(
+            prev_network, 
+            self.config, 
+            training_mode=False,
+            device=self.device,
+            batch_size=self.mcts_batch_size if self.device.type == 'cuda' else 1
+        )
         
         # Run evaluation games
         game_engine = HeadlessChessGame()
@@ -348,6 +577,10 @@ class AlphaZeroTrainer:
         
         # Track game results
         results = {'wins': 0, 'losses': 0, 'draws': 0}
+        
+        # Clear GPU cache before evaluation
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
         
         for game_num in range(total_games):
             # Alternate colors
@@ -379,7 +612,7 @@ class AlphaZeroTrainer:
                 results['draws'] += 1
                 wins += 0.5
             elif (game_num % 2 == 0 and result['winner'].value == 'white') or \
-                 (game_num % 2 == 1 and result['winner'].value == 'black'):
+                (game_num % 2 == 1 and result['winner'].value == 'black'):
                 # Current model won
                 results['wins'] += 1
                 wins += 1
@@ -390,14 +623,22 @@ class AlphaZeroTrainer:
             # Display progress
             win_rate = wins / (game_num + 1)
             print(f"Evaluation: Game {game_num+1}/{total_games}, current win rate: {win_rate:.2%}")
+            
+            # Periodically clear GPU cache during evaluation
+            if self.device.type == 'cuda' and game_num % 5 == 0:
+                torch.cuda.empty_cache()
         
         # Calculate final win rate
         win_rate = wins / total_games
         print(f"Evaluation complete: Win rate: {win_rate:.2%} (W:{results['wins']}, L:{results['losses']}, D:{results['draws']})")
+        
+        # Switch back to training mode
+        self.network.train()
+        
         return win_rate
-    
+        
     def save_model(self, filename: str):
-        """Save model state"""
+        """Save model state with optimization"""
         # Make sure the directory exists
         os.makedirs(self.config.model_dir, exist_ok=True)
         
@@ -407,15 +648,46 @@ class AlphaZeroTrainer:
             filename = os.path.basename(filename)
         
         model_path = os.path.join(self.config.model_dir, filename)
-        torch.save(self.network.state_dict(), model_path)
-        print(f"Model saved to {model_path}")
-    
+        
+        # Use torch.jit.script for optimized model if possible
+        try:
+            if self.device.type == 'cuda':
+                # Save optimized model with CUDA support
+                scripted_model = torch.jit.script(self.network)
+                scripted_model.save(model_path)
+                print(f"Optimized model saved to {model_path}")
+            else:
+                # Regular save for CPU
+                torch.save(self.network.state_dict(), model_path)
+                print(f"Model saved to {model_path}")
+        except Exception as e:
+            print(f"Error saving optimized model: {e}, falling back to standard save")
+            torch.save(self.network.state_dict(), model_path)
+            print(f"Model saved to {model_path}")
+
     def load_model(self, filename: str):
-        """Load model state"""
+        """Load model state with CUDA optimization"""
         model_path = os.path.join(self.config.model_dir, filename)
         if os.path.exists(model_path):
-            self.network.load_state_dict(torch.load(model_path, map_location=self.device))
-            print(f"Model loaded from {model_path}")
+            try:
+                # Try loading as optimized model first
+                if self.device.type == 'cuda':
+                    try:
+                        optimized_model = torch.jit.load(model_path, map_location=self.device)
+                        # Copy parameters from optimized model to regular model
+                        for param_name, param in self.network.named_parameters():
+                            if param_name in optimized_model.state_dict():
+                                param.data.copy_(optimized_model.state_dict()[param_name])
+                        print(f"Optimized model loaded from {model_path}")
+                        return
+                    except:
+                        pass  # Fall back to normal loading
+                
+                # Normal loading
+                self.network.load_state_dict(torch.load(model_path, map_location=self.device))
+                print(f"Model loaded from {model_path}")
+            except Exception as e:
+                print(f"Error loading model: {e}")
         else:
             print(f"Model file not found: {model_path}")
     
