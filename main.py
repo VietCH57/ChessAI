@@ -264,14 +264,24 @@ def main():
         print(f"\nTraining completed in {total_time/3600:.2f} hours")
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
-        trainer.save_model("models/interrupted_checkpoint.pt")
-        trainer.save_training_history()
+        try:
+            trainer.save_model("interrupted_checkpoint.pt")
+            trainer.save_training_history()
+            print("Emergency save completed")
+        except Exception as e:
+            print(f"Error during emergency save: {e}")
     except Exception as e:
         print(f"\nTraining error: {e}")
         import traceback
         traceback.print_exc()
-        trainer.save_model("models/error_checkpoint.pt")
-        trainer.save_training_history()
+        try:
+            # Save emergency checkpoint with current iteration number
+            emergency_name = f"error_checkpoint_iter_{trainer.iteration}.pt"
+            trainer.save_model(emergency_name)
+            trainer.save_training_history()
+            print(f"Emergency checkpoint saved as {emergency_name}")
+        except Exception as save_error:
+            print(f"Error during emergency save: {save_error}")
         raise
 
 if __name__ == "__main__":

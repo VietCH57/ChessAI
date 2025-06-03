@@ -16,10 +16,10 @@ def main():
     # game.toggle_ai(white_ai=my_ai)
     minimax_ai = MinimaxChessAI(depth=3)
     alphabeta_ai = AlphaBetaChessAI(depth=3)
-    alphazero_ai = AlphaZeroChessAI.from_checkpoint(r"D:\Programming\IntroAI\ChessAI\models\checkpoint_10.pt")
+    alphazero_ai = AlphaZeroChessAI.from_checkpoint(r"D:\Programming\IntroAI\ChessAI\models\best_model.pt")
     
     # HOẶC, để AI của bạn chơi với AI kháckhác
-    game.toggle_ai(white_ai=minimax_ai,black_ai=alphabeta_ai)
+    game.toggle_ai(white_ai=alphazero_ai,black_ai=alphabeta_ai)
     
     # HOẶC, để chơi lại chính AI của bạn
     # game.toggle_ai(black_ai=AlphaBetaChessAI(depth=3))

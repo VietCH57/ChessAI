@@ -34,7 +34,7 @@ class AlphaZeroChessAI(AlphaZeroAI):
             if model_path.endswith("_weights.pt"):
                 # Load regular state dict
                 network = AlphaZeroNetwork(config).to(device)
-                network.load_state_dict(torch.load(model_path, map_location=device))
+                network.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
                 network.eval()
                 print(f"Loaded weights from {model_path}")
             else:
@@ -50,18 +50,26 @@ class AlphaZeroChessAI(AlphaZeroAI):
                         network = AlphaZeroNetwork(config).to(device)
                         # Load with weights_only=False
                         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-                        network.load_state_dict(checkpoint)
+                        
+                        # Handle both raw state dict and wrapped checkpoint
+                        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                            network.load_state_dict(checkpoint['state_dict'])
+                        else:
+                            network.load_state_dict(checkpoint)
                         network.eval()
                         print(f"Loaded model state dict from {model_path} with weights_only=False")
                     except Exception as e:
-                        # Last attempt - plain loading
+                        print(f"Error loading with weights_only=False: {e}")
+                        # Last attempt - create empty network and warn
                         network = AlphaZeroNetwork(config).to(device)
-                        network.load_state_dict(torch.load(model_path, map_location=device))
                         network.eval()
-                        print(f"Loaded model state dict from {model_path}")
+                        print(f"Warning: Could not load checkpoint, using randomly initialized network")
         except Exception as e:
             print(f"Error loading model: {e}")
-            raise
+            # Create empty network as fallback
+            network = AlphaZeroNetwork(config).to(device)
+            network.eval()
+            print("Using randomly initialized network due to loading error")
 
         return cls(network, config, training_mode=False)
     

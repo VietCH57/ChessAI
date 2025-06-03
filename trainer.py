@@ -193,7 +193,7 @@ class AlphaZeroTrainer:
         os.makedirs(self.config.data_dir, exist_ok=True)
     
     def train(self):
-        """Main training loop with optimizations"""
+        """Main training loop with improved error handling"""
         print("Starting AlphaZero training...")
         print(f"Device: {self.device}")
         print(f"Configuration: {self.config}")
@@ -206,63 +206,27 @@ class AlphaZeroTrainer:
             # Generate self-play games
             print("Generating self-play games...")
             try:
-                # Use GPU parallel processing if on CUDA
-                if self.device.type == 'cuda' and self.config.use_gpu_parallel:
-                    # Determine optimal parallel game count based on GPU memory
-                    try:
-                        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
-                        # More conservative estimate based on available memory
-                        available_mem = (gpu_mem - (torch.cuda.memory_allocated(0) / 1024**3)) * 0.8  # 80% of available
-                        parallel_games = min(8, max(2, int(available_mem / 0.5)))  # ~500MB per game
-                        print(f"Available GPU memory: {available_mem:.1f}GB")
-                    except Exception as e:
-                        print(f"Error estimating memory: {e}")
-                        parallel_games = 2  # Conservative default
-                    
-                    print(f"Using GPU parallel mode with {parallel_games} simultaneous games")
-                    torch.cuda.empty_cache()  # Clear cache before starting
-                    
-                    # Make sure network is in eval mode for inference
-                    self.network.eval()
-                    
+                if hasattr(self.config, 'use_gpu_parallel') and self.config.use_gpu_parallel:
+                    # Use GPU parallel self-play generator
                     gpu_generator = GPUParallelSelfPlayGenerator(
                         self.network, 
                         self.config, 
                         device=self.device,
-                        num_parallel_games=parallel_games
+                        num_parallel_games=self.config.parallel_games
                     )
-                    training_examples = gpu_generator.generate_games(
-                        self.config.episodes_per_iteration
-                    )
-                elif self.config.num_workers > 1 and hasattr(self.selfplay_generator, 'generate_games_parallel'):
-                    # Use parallel CPU generation if not on CUDA
-                    print("Using CPU parallel mode")
-                    training_examples = self.selfplay_generator.generate_games_parallel(
-                        self.config.episodes_per_iteration,
-                        num_processes=self.config.num_workers
-                    )
+                    training_examples = gpu_generator.generate_games(self.config.episodes_per_iteration)
                 else:
-                    # Fallback to sequential generation
-                    print("Using sequential generation mode")
-                    training_examples = self.selfplay_generator.generate_games(
-                        self.config.episodes_per_iteration
-                    )
+                    # Use standard self-play generator
+                    training_examples = self.selfplay_generator.generate_games(self.config.episodes_per_iteration)
                     
-                # Switch back to training mode after generation
-                self.network.train()
-                
-                print(f"Generated {len(training_examples)} training examples")
             except Exception as e:
-                print(f"Error in game generation: {e}. Falling back to sequential mode.")
+                print(f"Error in self-play generation: {e}")
                 traceback.print_exc()
-                # Emergency fallback
-                training_examples = self.selfplay_generator.generate_games(
-                    self.config.episodes_per_iteration
-                )
+                training_examples = []
             
             # Skip training if no examples generated
             if not training_examples:
-                print("No training examples generated. Skipping iteration.")
+                print("No training examples generated, skipping iteration")
                 continue
             
             # Add to replay buffer
@@ -272,19 +236,28 @@ class AlphaZeroTrainer:
             # Train neural network
             avg_loss = self.train_network()
             
-            # Evaluate model against previous best
+            # SAVE CHECKPOINT FIRST - before evaluation
             if (iteration + 1) % self.config.checkpoint_interval == 0:
-                print("Evaluating model against previous best...")
-                win_rate = self.evaluate_model()
+                try:
+                    self.save_checkpoint(iteration + 1)
+                    print(f"Checkpoint {iteration + 1} saved successfully")
+                except Exception as e:
+                    print(f"Error saving checkpoint: {e}")
+                    traceback.print_exc()
                 
-                # Save model if it's better than the previous best
-                if win_rate >= self.config.win_rate_threshold:
-                    print(f"New best model with win rate: {win_rate:.2%}")
-                    self.save_model("best_model.pt")
-                
-                # Always save a checkpoint
-                self.save_model(f"checkpoint_{iteration + 1}.pt")
-                
+                # THEN evaluate model
+                try:
+                    win_rate = self.evaluate_model()
+                    
+                    if win_rate >= self.config.win_rate_threshold:
+                        self.save_best_model()
+                        print(f"New best model saved (win rate: {win_rate:.3f})")
+                        
+                except Exception as e:
+                    print(f"Error in evaluation: {e}")
+                    traceback.print_exc()
+                    print("Continuing training without evaluation...")
+            
             # Record training stats
             elapsed_time = time.time() - iter_start_time
             stats = {
@@ -533,109 +506,203 @@ class AlphaZeroTrainer:
         
         return augmented
         
+    def find_latest_checkpoint(self):
+        """Find the latest checkpoint file"""
+        checkpoint_files = []
+        
+        try:
+            for file in os.listdir(self.config.model_dir):
+                if file.startswith("checkpoint_") and file.endswith(".pt"):
+                    try:
+                        # Extract iteration number from filename
+                        iteration_str = file.replace("checkpoint_", "").replace(".pt", "")
+                        iteration_num = int(iteration_str)
+                        checkpoint_files.append((iteration_num, file))
+                    except ValueError:
+                        continue
+            
+            if checkpoint_files:
+                # Sort by iteration number and return the latest
+                latest = max(checkpoint_files, key=lambda x: x[0])
+                return latest[1]  # Return filename
+            
+        except Exception as e:
+            print(f"Error finding latest checkpoint: {e}")
+        
+        return None
+
     def evaluate_model(self) -> float:
         """Evaluate current model against previous best model with CUDA optimizations"""
-        # Skip if no previous model
-        if not os.path.exists(os.path.join(self.config.model_dir, "best_model.pt")):
-            print("No previous best model found, skipping evaluation")
-            return 1.0
-        
         print("Starting model evaluation against previous best")
         
-        # Load previous best model
-        prev_network = AlphaZeroNetwork(self.config)
-        prev_network = prev_network.to(self.device)
+        # Find previous best model with improved logic
+        prev_model_path = None
         
-        prev_model_path = os.path.join(self.config.model_dir, "best_model.pt")
-        prev_network.load_state_dict(torch.load(prev_model_path, map_location=self.device))
+        # Priority 1: Look for best_model.pt
+        if os.path.exists(os.path.join(self.config.model_dir, "best_model.pt")):
+            prev_model_path = os.path.join(self.config.model_dir, "best_model.pt")
+            print("Using best_model.pt for comparison")
+        else:
+            # Priority 2: Look for latest checkpoint
+            latest_checkpoint = self.find_latest_checkpoint()
+            if latest_checkpoint:
+                prev_model_path = os.path.join(self.config.model_dir, latest_checkpoint)
+                print(f"Using latest checkpoint {latest_checkpoint} for comparison")
         
-        # Enable eval mode to optimize inference
-        self.network.eval()
-        prev_network.eval()
+        if not prev_model_path:
+            print("No previous model found, accepting current model as best")
+            return 1.0
         
-        # Create AIs with CUDA optimization flags
-        current_ai = AlphaZeroAI(
-            self.network, 
-            self.config, 
-            training_mode=False,
-            device=self.device,
-            batch_size=self.mcts_batch_size if self.device.type == 'cuda' else 1
-        )
-        
-        previous_ai = AlphaZeroAI(
-            prev_network, 
-            self.config, 
-            training_mode=False,
-            device=self.device,
-            batch_size=self.mcts_batch_size if self.device.type == 'cuda' else 1
-        )
-        
-        # Run evaluation games
-        game_engine = HeadlessChessGame()
-        wins = 0
-        total_games = self.config.evaluation_games
-        
-        # Track game results
-        results = {'wins': 0, 'losses': 0, 'draws': 0}
-        
-        # Clear GPU cache before evaluation
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-        
-        for game_num in range(total_games):
-            # Alternate colors
-            if game_num % 2 == 0:
-                white_ai, black_ai = current_ai, previous_ai
-            else:
-                white_ai, black_ai = previous_ai, current_ai
+        try:
+            # Load previous best model
+            prev_network = AlphaZeroNetwork(self.config)
+            prev_network = prev_network.to(self.device)
             
-            # Reset move counters
-            white_ai.reset_move_count()
-            black_ai.reset_move_count()
+            # Try different loading methods for PyTorch 2.6+ compatibility
+            try:
+                # First try: weights_only=False for PyTorch 2.6+
+                prev_network.load_state_dict(torch.load(prev_model_path, map_location=self.device, weights_only=False))
+                print("Loaded previous model with weights_only=False")
+            except Exception as e1:
+                try:
+                    # Second try: TorchScript load
+                    prev_network = torch.jit.load(prev_model_path, map_location=self.device)
+                    print("Loaded previous model as TorchScript")
+                except Exception as e2:
+                    print(f"Could not load previous model: {e1}, {e2}")
+                    print("Accepting current model as best due to loading error")
+                    return 1.0
             
-            # Run game with reduced simulation count for speed
-            config_backup = self.config.num_simulations
-            self.config.num_simulations = max(200, self.config.num_simulations // 2)
+            # Enable eval mode
+            self.network.eval()
+            prev_network.eval()
             
-            result = game_engine.run_game(
-                white_ai, black_ai, 
-                max_moves=self.config.max_moves_per_game,
-                collect_data=False
+            # Create AIs with CUDA optimization flags
+            current_ai = AlphaZeroAI(
+                self.network, 
+                self.config, 
+                training_mode=False,
+                device=self.device,
+                batch_size=self.mcts_batch_size if self.device.type == 'cuda' else 1
             )
             
-            # Restore simulation count
-            self.config.num_simulations = config_backup
+            previous_ai = AlphaZeroAI(
+                prev_network, 
+                self.config, 
+                training_mode=False,
+                device=self.device,
+                batch_size=self.mcts_batch_size if self.device.type == 'cuda' else 1
+            )
             
-            # Track results
-            if result['winner'] is None:
-                # Draw
-                results['draws'] += 1
-                wins += 0.5
-            elif (game_num % 2 == 0 and result['winner'].value == 'white') or \
-                (game_num % 2 == 1 and result['winner'].value == 'black'):
-                # Current model won
-                results['wins'] += 1
-                wins += 1
-            else:
-                # Current model lost
-                results['losses'] += 1
+            # Run evaluation games
+            game_engine = HeadlessChessGame()
+            wins = 0
+            total_games = self.config.evaluation_games
             
-            # Display progress
-            win_rate = wins / (game_num + 1)
-            print(f"Evaluation: Game {game_num+1}/{total_games}, current win rate: {win_rate:.2%}")
+            # Track game results
+            results = {'wins': 0, 'losses': 0, 'draws': 0}
             
-            # Periodically clear GPU cache during evaluation
-            if self.device.type == 'cuda' and game_num % 5 == 0:
+            # Clear GPU cache before evaluation
+            if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
+            
+            for game_num in range(total_games):
+                # Alternate colors
+                if game_num % 2 == 0:
+                    white_ai, black_ai = current_ai, previous_ai
+                else:
+                    white_ai, black_ai = previous_ai, current_ai
+                
+                # Reset move counters
+                white_ai.reset_move_count()
+                black_ai.reset_move_count()
+                
+                # Run game with reduced simulation count for speed
+                config_backup = self.config.num_simulations
+                self.config.num_simulations = max(200, self.config.num_simulations // 2)
+                
+                result = game_engine.run_game(
+                    white_ai, black_ai, 
+                    max_moves=self.config.max_moves_per_game,
+                    collect_data=False
+                )
+                
+                # Restore simulation count
+                self.config.num_simulations = config_backup
+                
+                # Track results
+                if result['winner'] is None:
+                    results['draws'] += 1
+                elif (game_num % 2 == 0 and result['winner'].value == 'white') or \
+                    (game_num % 2 == 1 and result['winner'].value == 'black'):
+                    results['wins'] += 1
+                    wins += 1
+                else:
+                    results['losses'] += 1
+                
+                # Display progress
+                win_rate = wins / (game_num + 1)
+                print(f"Evaluation: Game {game_num+1}/{total_games}, current win rate: {win_rate:.2%}")
+                
+                # Periodically clear GPU cache during evaluation
+                if self.device.type == 'cuda' and game_num % 5 == 0:
+                    torch.cuda.empty_cache()
+            
+            # Calculate final win rate
+            win_rate = wins / total_games
+            print(f"Evaluation complete: Win rate: {win_rate:.2%} (W:{results['wins']}, L:{results['losses']}, D:{results['draws']})")
+            
+            # Switch back to training mode
+            self.network.train()
+            
+            return win_rate
+            
+        except Exception as e:
+            print(f"Error during evaluation: {e}")
+            print("Accepting current model as best due to evaluation error")
+            return 1.0
         
-        # Calculate final win rate
-        win_rate = wins / total_games
-        print(f"Evaluation complete: Win rate: {win_rate:.2%} (W:{results['wins']}, L:{results['losses']}, D:{results['draws']})")
-        
-        # Switch back to training mode
-        self.network.train()
-        
-        return win_rate
+    def save_checkpoint(self, iteration: int):
+        """Save model checkpoint"""
+        try:
+            checkpoint_path = os.path.join(self.config.model_dir, f"checkpoint_{iteration}.pt")
+            
+            # Save state dict instead of TorchScript to avoid loading issues
+            torch.save(self.network.state_dict(), checkpoint_path)
+            print(f"Checkpoint saved: {checkpoint_path}")
+            
+            # Also save as TorchScript for deployment (separate file)
+            try:
+                script_path = os.path.join(self.config.model_dir, f"checkpoint_{iteration}_script.pt")
+                scripted_model = torch.jit.script(self.network)
+                torch.jit.save(scripted_model, script_path)
+                print(f"TorchScript model saved: {script_path}")
+            except Exception as e:
+                print(f"Warning: Could not save TorchScript version: {e}")
+                
+        except Exception as e:
+            print(f"Error saving checkpoint: {e}")
+    
+    def save_best_model(self):
+        """Save the best model"""
+        try:
+            best_path = os.path.join(self.config.model_dir, "best_model.pt")
+            
+            # Save state dict instead of TorchScript
+            torch.save(self.network.state_dict(), best_path)
+            print(f"Best model saved: {best_path}")
+            
+            # Also save as TorchScript for deployment (separate file)
+            try:
+                script_path = os.path.join(self.config.model_dir, "best_model_script.pt")
+                scripted_model = torch.jit.script(self.network)
+                torch.jit.save(scripted_model, script_path)
+                print(f"Best TorchScript model saved: {script_path}")
+            except Exception as e:
+                print(f"Warning: Could not save TorchScript version: {e}")
+                
+        except Exception as e:
+            print(f"Error saving best model: {e}")
         
     def save_model(self, filename: str):
         """Save model state with dual format for both training and inference"""
@@ -649,35 +716,37 @@ class AlphaZeroTrainer:
         
         model_path = os.path.join(self.config.model_dir, filename)
         
-        # ALWAYS save a state_dict version for training
-        weights_path = os.path.splitext(model_path)[0] + "_weights.pt"
-        torch.save(self.network.state_dict(), weights_path)
-        print(f"Model weights saved to {weights_path}")
-        
-        # Then save TorchScript version for inference if GPU available
+        # ALWAYS save a state_dict version for training compatibility
         try:
-            if self.device.type == 'cuda':
-                self.network.eval()  # Set to eval mode for tracing
-                # Create example input
-                dummy_input = torch.zeros(1, self.config.input_planes, 8, 8, device=self.device)
-                
-                # Use scripting instead of tracing for more complete model capture
-                scripted_model = torch.jit.script(self.network)
-                
-                # Save the scripted model
-                scripted_model.save(model_path)
-                print(f"TorchScript model saved to {model_path}")
-                
-                # Restore training mode
-                self.network.train()
-            else:
-                # For CPU, just use regular state_dict
-                torch.save(self.network.state_dict(), model_path)
-                print(f"Model saved to {model_path}")
-        except Exception as e:
-            print(f"Error saving TorchScript model: {e}, falling back to standard save")
             torch.save(self.network.state_dict(), model_path)
-            print(f"Model saved to {model_path}")
+            print(f"Model weights saved to {model_path}")
+        except Exception as e:
+            print(f"Error saving model weights: {e}")
+            # Try saving with explicit CPU transfer
+            try:
+                state_dict = {k: v.cpu() for k, v in self.network.state_dict().items()}
+                torch.save(state_dict, model_path)
+                print(f"Model weights saved to {model_path} (CPU transfer)")
+            except Exception as e2:
+                print(f"Failed to save model: {e2}")
+                raise e2
+        
+        # Additionally save TorchScript version if possible
+        try:
+            script_path = os.path.splitext(model_path)[0] + "_script.pt"
+            if self.device.type == 'cuda':
+                # Move to CPU for TorchScript saving to avoid device issues
+                cpu_network = self.network.cpu()
+                scripted_model = torch.jit.script(cpu_network)
+                torch.jit.save(scripted_model, script_path)
+                # Move back to original device
+                self.network = self.network.to(self.device)
+            else:
+                scripted_model = torch.jit.script(self.network)
+                torch.jit.save(scripted_model, script_path)
+            print(f"TorchScript model saved to {script_path}")
+        except Exception as e:
+            print(f"Warning: Could not save TorchScript version: {e}")
 
     def load_model(self, filename: str):
         """Load model with compatibility for both training and PyTorch 2.6+"""
@@ -687,46 +756,28 @@ class AlphaZeroTrainer:
         # First try to load from weights file (for training)
         if os.path.exists(weights_path):
             try:
-                self.network.load_state_dict(torch.load(weights_path, map_location=self.device))
-                print(f"Model weights loaded from {weights_path}")
+                self.network.load_state_dict(torch.load(weights_path, map_location=self.device, weights_only=False))
+                print(f"Model loaded from weights: {weights_path}")
                 return
             except Exception as e:
-                print(f"Error loading weights from {weights_path}: {e}")
+                print(f"Failed to load weights file {weights_path}: {e}")
         
         # If weights file doesn't exist or failed to load, try main file
         if os.path.exists(model_path):
             try:
-                # Handle PyTorch 2.6+ compatibility for TorchScript
+                # Try PyTorch 2.6+ compatible loading first
+                self.network.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=False))
+                print(f"Model loaded from: {model_path}")
+                return
+            except Exception as e1:
                 try:
-                    # First try to load as TorchScript model
-                    model = torch.jit.load(model_path, map_location=self.device)
-                    print(f"Loaded TorchScript model from {model_path}")
-                    
-                    # For inference only usage, can just use this model directly
-                    if hasattr(self, "_jit_model"):
-                        self._jit_model = model
-                        
-                    # For training, need to re-initialize
-                    self.network.eval()
+                    # Try TorchScript loading
+                    self.network = torch.jit.load(model_path, map_location=self.device)
+                    print(f"TorchScript model loaded from: {model_path}")
                     return
-                except Exception as jit_error:
-                    print(f"Not a TorchScript model or error loading: {jit_error}")
-                    
-                    # Try loading as regular state dict with explicit weights_only=False
-                    try:
-                        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-                        # If it's a state dict, load directly
-                        if isinstance(checkpoint, dict):
-                            self.network.load_state_dict(checkpoint)
-                        print(f"Model loaded from {model_path} with weights_only=False")
-                    except Exception as e:
-                        # Last resort - try with default options
-                        checkpoint = torch.load(model_path, map_location=self.device)
-                        self.network.load_state_dict(checkpoint)
-                        print(f"Model loaded from {model_path}")
-            except Exception as e:
-                print(f"Failed to load model: {e}")
-                raise
+                except Exception as e2:
+                    print(f"Failed to load model: {e1}, {e2}")
+                    raise e1
         else:
             print(f"No model file found at {model_path} or {weights_path}")
             raise FileNotFoundError(f"Model not found: {model_path}")
