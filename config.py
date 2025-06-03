@@ -38,8 +38,9 @@ class AlphaZeroConfig:
     data_dir: str = "training_data"
     
     # Hardware
-    device: str = "cuda"  # or "cpu"
+    device: str = "cuda"  # "cuda", "cpu", or "tpu"
     num_workers: int = 4
+    tpu_cores: int = 8  # Number of TPU cores to use
     
     # Optimization flags
     tree_reuse: bool = True 
@@ -48,4 +49,4 @@ class AlphaZeroConfig:
     half_precision: bool = True  
     batch_mcts: bool = True 
     use_cache: bool = True  
-    memory_efficient: bool = True 
+    memory_efficient: bool = True

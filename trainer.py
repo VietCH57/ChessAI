@@ -12,6 +12,18 @@ import random
 import time
 from datetime import datetime, timedelta
 
+# TPU imports - kiểm tra và import nếu có thể
+USE_TPU = os.environ.get('COLAB_TPU_ADDR') is not None
+if USE_TPU:
+    try:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        import torch_xla.distributed.parallel_loader as pl
+        print("TPU available, configuring PyTorch XLA")
+    except ImportError:
+        print("PyTorch XLA not available. Install with: pip install torch_xla")
+        USE_TPU = False
+
 from network import AlphaZeroNetwork
 from config import AlphaZeroConfig
 from selfplay import SelfPlayGenerator, AlphaZeroAI
@@ -51,11 +63,16 @@ class AlphaZeroTrainer:
             weight_decay=config.weight_decay
         )
         
-        # Move network to correct device
-        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        # Move network to correct device - with TPU support
+        if USE_TPU:
+            self.device = xm.xla_device()
+            print(f"Using TPU device: {self.device}")
+        else:
+            self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        
         self.network = self.network.to(self.device)
         
-        # Enable cuDNN benchmarking for faster training
+        # Enable cuDNN benchmarking for faster training (only for GPU)
         if self.device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
             
@@ -176,7 +193,7 @@ class AlphaZeroTrainer:
             self.scheduler.step(train_loss)
     
     def train_network(self) -> float:
-        """Train the neural network with optimized data handling"""
+        """Train the neural network with optimized data handling and TPU support"""
         if len(self.replay_buffer) < self.config.batch_size:
             return 0.0
         
@@ -195,9 +212,13 @@ class AlphaZeroTrainer:
             dataset, 
             batch_size=self.config.batch_size, 
             shuffle=True, 
-            num_workers=0,  # Multiprocessing can cause issues with CUDA
+            num_workers=0,  # TPU requires num_workers=0
             pin_memory=True if self.device.type == 'cuda' else False
         )
+        
+        # Wrap dataloader with ParallelLoader for TPU
+        if USE_TPU:
+            dataloader = pl.ParallelLoader(dataloader, [self.device]).per_device_loader(self.device)
         
         # Training loop
         self.network.train()
@@ -213,7 +234,7 @@ class AlphaZeroTrainer:
         
         for epoch in range(num_epochs):
             for states, target_policies, target_values in dataloader:
-                # Move tensors to device
+                # Move tensors to device - non_blocking for better performance
                 states = states.to(self.device, non_blocking=True)
                 target_policies = target_policies.to(self.device, non_blocking=True)
                 target_values = target_values.to(self.device, non_blocking=True)
@@ -235,7 +256,12 @@ class AlphaZeroTrainer:
                 # Clip gradients to prevent explosions
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
                 
-                self.optimizer.step()
+                # Optimizer step with TPU sync
+                if USE_TPU:
+                    xm.optimizer_step(self.optimizer)
+                    xm.mark_step()  # Important for TPU performance
+                else:
+                    self.optimizer.step()
                 
                 # Track losses
                 total_loss += total_loss_batch.item()

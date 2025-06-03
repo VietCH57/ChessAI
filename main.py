@@ -6,13 +6,18 @@ import time
 from config import AlphaZeroConfig
 from trainer import AlphaZeroTrainer
 
-import torch.multiprocessing as mp
-if __name__ == "__main__":
-    # Set multiprocessing start method to 'spawn' for CUDA compatibility
+# Check for TPU availability
+USE_TPU = os.environ.get('COLAB_TPU_ADDR') is not None
+
+if USE_TPU:
     try:
-        mp.set_start_method('spawn')
-    except RuntimeError:
-        pass
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        print("TPU available, configuring PyTorch XLA")
+        TPU_DEVICE = xm.xla_device()
+    except ImportError:
+        print("PyTorch XLA not available. Install with: pip install torch_xla")
+        USE_TPU = False
 
 def main():
     parser = argparse.ArgumentParser(description='AlphaZero Chess Training')
@@ -29,9 +34,12 @@ def main():
     parser.add_argument('--filters', type=int, default=128)          
     
     # Hardware & optimization
-    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--device', type=str, default='auto', 
+                        help='Device to use: auto, cpu, cuda, or tpu')
     parser.add_argument('--workers', type=int, default=4)           
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--use-tpu', action='store_true', help='Force TPU usage')
+    parser.add_argument('--tpu-cores', type=int, default=8, help='Number of TPU cores to use')
     parser.add_argument('--disable-tree-reuse', action='store_true', help='Disable MCTS tree reuse')
     parser.add_argument('--disable-data-augmentation', action='store_true', help='Disable data augmentation')
     parser.add_argument('--jit', action='store_true', help='Use PyTorch JIT compilation')
@@ -41,16 +49,28 @@ def main():
     
     args = parser.parse_args()
     
-    # Configure CUDA for optimal performance
-    if args.device == 'cuda' and torch.cuda.is_available():
-        # Enable TF32 for better performance on Ampere GPUs
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        # Enable cuDNN benchmarking for faster convolutions
-        torch.backends.cudnn.benchmark = True
-        
-        # Optimize batch size based on available GPU memory
+    # Determine device
+    if args.device == 'auto':
+        if args.use_tpu or USE_TPU:
+            device = 'tpu'
+        elif torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = 'cpu'
+    else:
+        device = args.device
+    
+    # Configure optimal batch size
+    if device == 'tpu':
+        # TPU typically works well with larger batch sizes
+        optimal_batch_size = max(128, args.batch_size)
+        # TPU-optimized parameters
+        optimal_filters = 256  # TPUs handle larger models efficiently
+        optimal_blocks = 20    # More blocks for better model capacity
+        optimal_workers = 0    # TPU requires num_workers=0
+        print(f"TPU mode: Using {args.tpu_cores} cores with batch size {optimal_batch_size}")
+    elif device == 'cuda' and torch.cuda.is_available():
+        # GPU settings
         try:
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
             if gpu_mem < 6:  # Low memory GPU (< 6GB)
@@ -67,33 +87,30 @@ def main():
                 optimal_blocks = args.residual_blocks
                 
             print(f"GPU Memory: {gpu_mem:.1f}GB, Optimized batch size: {optimal_batch_size}")
+            
+            # Optimize workers for GPU
+            logical_cores = psutil.cpu_count(logical=True) or 4
+            optimal_workers = min(args.workers, max(2, logical_cores // 2))
         except Exception as e:
             print(f"Error detecting GPU specs: {e}, using default parameters")
             optimal_batch_size = args.batch_size
             optimal_filters = args.filters
             optimal_blocks = args.residual_blocks
+            optimal_workers = args.workers
     else:
         # CPU mode
         print("Running on CPU. Consider using GPU for faster training.")
         optimal_batch_size = min(args.batch_size, 16)  # Smaller batches on CPU
         optimal_filters = min(args.filters, 64)        # Smaller network on CPU
         optimal_blocks = min(args.residual_blocks, 6)  # Fewer blocks on CPU
-    
-    # Optimize number of workers based on CPU cores
-    physical_cores = psutil.cpu_count(logical=False) or 2
-    optimal_workers = min(args.workers, max(1, physical_cores - 1))
-    print(f"CPU Cores: {physical_cores}, Using {optimal_workers} worker processes")
+        
+        # Optimize workers for CPU
+        physical_cores = psutil.cpu_count(logical=False) or 2
+        logical_cores = psutil.cpu_count(logical=True) or physical_cores
+        optimal_workers = min(args.workers, max(1, physical_cores - 1))
     
     # Memory optimization settings
     memory_efficient = True  # Always use memory optimization
-    
-    # Overide (because i'm too lazy to type the full command line arguments)
-    tree_reuse = True
-    data_augmentation = True
-    use_jit = True
-    half_precision = True
-    batch_mcts = True
-    use_cache = True
     
     # Create configuration
     config = AlphaZeroConfig(
@@ -104,16 +121,16 @@ def main():
         learning_rate=args.learning_rate,
         num_residual_blocks=optimal_blocks,
         num_filters=optimal_filters,
-        device=args.device if torch.cuda.is_available() else "cpu",
+        device=device,
         num_workers=optimal_workers,
         
-        # Sử dụng biến override thay vì args
-        tree_reuse=tree_reuse,
-        data_augmentation=data_augmentation,
-        use_jit=use_jit,
-        half_precision=half_precision,
-        batch_mcts=batch_mcts,
-        use_cache=use_cache,
+        # Optimization flags
+        tree_reuse=not args.disable_tree_reuse,
+        data_augmentation=not args.disable_data_augmentation,
+        use_jit=args.jit,
+        half_precision=args.half_precision,
+        batch_mcts=args.batch_mcts,
+        use_cache=args.use_cache,
         memory_efficient=memory_efficient
     )
     
