@@ -20,7 +20,7 @@ class ChessBenchmark:
     """
     
     def __init__(self, use_gpu=False):
-        self.use_gpu = use_gpu
+        self.use_gpu = True
         self.device = self.setup_gpu()
         self.max_workers = min(8, multiprocessing.cpu_count())
         
@@ -345,12 +345,11 @@ def main():
     print()
     
     # Chọn 2 AI
-    ai1 = select_ai("Select first AI (AI1):")
-    ai2 = select_ai("Select second AI (AI2):")
+    ai1 = MinimaxChessAI(depth=3)  # Mặc định là Minimax
+    ai2 = AlphaBetaChessAI(depth=3)  # Mặc định là Alpha-Beta
     
     # Hỏi về GPU
-    use_gpu_input = input("\nUse discrete GPU for acceleration? (y/n): ").strip().lower()
-    use_gpu = use_gpu_input in ['y', 'yes', '1', 'true']
+    use_gpu = y
     
     # Khởi tạo benchmark system
     benchmark = ChessBenchmark(use_gpu=use_gpu)
