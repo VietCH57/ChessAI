@@ -7,41 +7,62 @@ from config import AlphaZeroConfig
 from interface import ChessAI
 from selfplay import AlphaZeroAI
 
+import torch
+from typing import Tuple
+from chess_board import ChessBoard, Position, PieceColor
+from config import AlphaZeroConfig
+from interface import ChessAI
+from selfplay import AlphaZeroAI
+
 class AlphaZeroChessAI(AlphaZeroAI):
-    """AlphaZero trained model for chess play using a pre-trained checkpoint"""
-    
+    """AlphaZero trained model for chess play using a pre-trained TorchScript model"""
+
     @classmethod
     def from_checkpoint(cls, model_path: str, num_simulations: int = 200):
-        """
-        Create an AlphaZero player from a trained model checkpoint.
-        """
-        # Create configuration
         config = AlphaZeroConfig(
             num_simulations=num_simulations,
             num_residual_blocks=12,
             num_filters=128,
-            batch_size=32,
-            max_moves_per_game=200,
+            batch_size=64,
+            max_moves_per_game=400,
             device="cuda" if torch.cuda.is_available() else "cpu"
         )
+        device = torch.device(config.device)
         
-        # Initialize network
-        network = AlphaZeroNetwork(config)
-        
-        # Load model weights
-        device = torch.device("cuda" if torch.cuda.is_available() and config.device == "cuda" else "cpu")
+        # Determine if the path points to a TorchScript model or a state dict
         try:
-            checkpoint = torch.load(model_path, map_location=device)
-            network.load_state_dict(checkpoint)
-            network = network.to(device)  # Ensure network is on the right device
-            print(f"Loaded AlphaZero model from {model_path}")
+            if model_path.endswith("_weights.pt"):
+                # Load regular state dict
+                network = AlphaZeroNetwork(config).to(device)
+                network.load_state_dict(torch.load(model_path, map_location=device))
+                network.eval()
+                print(f"Loaded weights from {model_path}")
+            else:
+                try:
+                    # Try loading as TorchScript model first
+                    network = torch.jit.load(model_path, map_location=device)
+                    network.eval()
+                    print(f"Loaded TorchScript model from {model_path}")
+                except Exception:
+                    # If that fails, try loading as a state dict with weights_only=False for PyTorch 2.6+
+                    try:
+                        # Create new network
+                        network = AlphaZeroNetwork(config).to(device)
+                        # Load with weights_only=False
+                        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+                        network.load_state_dict(checkpoint)
+                        network.eval()
+                        print(f"Loaded model state dict from {model_path} with weights_only=False")
+                    except Exception as e:
+                        # Last attempt - plain loading
+                        network = AlphaZeroNetwork(config).to(device)
+                        network.load_state_dict(torch.load(model_path, map_location=device))
+                        network.eval()
+                        print(f"Loaded model state dict from {model_path}")
         except Exception as e:
             print(f"Error loading model: {e}")
             raise
-            
-        network.eval()  # Set to evaluation mode
-        
-        # Return the AI instance
+
         return cls(network, config, training_mode=False)
     
     def get_move(self, board: ChessBoard, color: PieceColor) -> Tuple[Position, Position]:
