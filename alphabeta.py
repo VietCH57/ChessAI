@@ -19,6 +19,9 @@ class AlphaBetaChessAI(ChessAI):
         """
         self.depth = depth
         self.max_time = 10  # Maximum time in seconds for a move decision
+        self.position_history = {}  # Track position frequency
+        self.previous_moves = []    # Track last few moves
+        
         self.piece_values = {
             PieceType.PAWN: 100,
             PieceType.KNIGHT: 320,
@@ -107,6 +110,16 @@ class AlphaBetaChessAI(ChessAI):
             [-50,-30,-30,-30,-30,-30,-30,-50]
         ]
     
+    def hash_board(self, board):
+        """Create a simple hash representation of the board for repetition detection"""
+        board_str = ""
+        for row in range(8):
+            for col in range(8):
+                piece = board.get_piece(Position(row, col))
+                if piece.type != PieceType.EMPTY:
+                    board_str += f"{piece.type.value}{piece.color.value}{row}{col}"
+        return board_str
+    
     def get_move(self, board: ChessBoard, color: PieceColor) -> tuple[Position, Position]:
         """
         Get the best move using the Alpha-Beta Pruning algorithm.
@@ -122,17 +135,21 @@ class AlphaBetaChessAI(ChessAI):
         self.start_time = time.time()
         self.time_limit_exceeded = False
         
-        # Track best move and score
-        best_move = None
+        # Track board position before making a move
+        board_hash = self.hash_board(board)
+        self.position_history[board_hash] = self.position_history.get(board_hash, 0) + 1
+        
+        # Track best moves (not just the single best)
+        best_moves = []
         best_score = float('-inf')
         alpha = float('-inf')
         beta = float('inf')
         
         # Adjust depth based on game phase
         if self.count_pieces(board) <= 10:  # Endgame with few pieces
-            current_depth = min(self.depth, 4)  # Cap at depth 4 to prevent timeouts
+            current_depth = min(self.depth + 1, 5)  # Go deeper in endgame, cap at depth 5
         else:
-            current_depth = min(self.depth - 1, 3)  # Reduce depth in middlegame
+            current_depth = self.depth
         
         try:
             # Get all valid moves for all pieces of this color
@@ -166,6 +183,10 @@ class AlphaBetaChessAI(ChessAI):
                     print("Time limit exceeded, using best move found so far")
                     break
                 
+                # Check if this is a repeated move
+                if (from_pos, to_pos) in self.previous_moves[-4:]:  # Check last 4 moves
+                    continue  # Skip recently repeated moves unless we have no alternatives
+                
                 # Make the move on a copy of the board
                 temp_board = board.copy_board()
                 try:
@@ -181,17 +202,33 @@ class AlphaBetaChessAI(ChessAI):
                     print(f"Error in alpha_beta: {e}")
                     continue
                 
-                # Update best move if this move is better
-                if score > best_score:
+                # Update best moves list
+                if score > best_score + 10:  # Significantly better move
                     best_score = score
-                    best_move = (from_pos, to_pos)
-                
-                # Update alpha
-                alpha = max(alpha, best_score)
+                    best_moves = [(from_pos, to_pos)]
+                    alpha = max(alpha, best_score)  # Update alpha
+                elif abs(score - best_score) <= 10:  # Similar score, keep as alternative
+                    best_moves.append((from_pos, to_pos))
             
-            # If we found a valid move, return it
-            if best_move:
-                return best_move
+            # If we found valid moves, select one based on our strategy
+            if best_moves:
+                # Check if any move was already played recently
+                fresh_moves = [move for move in best_moves if move not in self.previous_moves]
+                if fresh_moves:
+                    # 80% chance to pick the best move, 20% chance to pick a random alternative
+                    if len(fresh_moves) > 1 and random.random() < 0.2:
+                        selected_move = random.choice(fresh_moves[1:])
+                    else:
+                        selected_move = fresh_moves[0]
+                else:
+                    selected_move = random.choice(best_moves)
+                
+                # Update move history
+                self.previous_moves.append(selected_move)
+                if len(self.previous_moves) > 8:  # Keep track of last 8 moves
+                    self.previous_moves.pop(0)
+                
+                return selected_move
                 
             # If we didn't find a good move (shouldn't happen), return the first valid move
             return all_moves[0]
@@ -253,6 +290,14 @@ class AlphaBetaChessAI(ChessAI):
             if piece.type == PieceType.PAWN and (to_pos.row == 0 or to_pos.row == 7):
                 score += 900  # Value of a queen
             
+            # Prioritize center control
+            if 2 <= to_pos.row <= 5 and 2 <= to_pos.col <= 5:
+                score += 20
+            
+            # Penalize moves that were recently played (avoid repetitions)
+            if (from_pos, to_pos) in self.previous_moves:
+                score -= 200
+            
             scored_moves.append((score, (from_pos, to_pos)))
         
         # Sort moves by score in descending order
@@ -290,9 +335,9 @@ class AlphaBetaChessAI(ChessAI):
         # Check for game-ending conditions
         opponent_color = PieceColor.BLACK if ai_color == PieceColor.WHITE else PieceColor.WHITE
         if board.is_checkmate(opponent_color):
-            return 10000  # AI wins
+            return 10000 + depth  # AI wins (add depth to prefer quicker checkmates)
         elif board.is_checkmate(ai_color):
-            return -10000  # AI loses
+            return -10000 - depth  # AI loses (subtract depth to prefer longer resistance)
         elif board.is_stalemate(board.turn):
             return 0  # Draw
         
@@ -390,33 +435,138 @@ class AlphaBetaChessAI(ChessAI):
                 # Get base material value
                 value = self.piece_values[piece.type]
                 
-                # Add position value based on piece type (simplified)
+                # Get position value based on piece type
                 position_value = 0
+                
+                # For Black pieces, we need to flip the row coordinate to get the correct table position
+                # since all tables are designed from White's perspective
+                table_row = row if piece.color == PieceColor.WHITE else 7 - row
+                
                 if piece.type == PieceType.PAWN:
-                    position_value = self.pawn_table[row][col]
+                    position_value = self.pawn_table[table_row][col]
+                    
+                    # Add bonus for pawn advancement
+                    if piece.color == PieceColor.WHITE:
+                        advancement = 7 - row  # How far the pawn has advanced
+                    else:
+                        advancement = row  # For black pawns
+                    
+                    position_value += advancement * 5  # Small bonus for advancement
+                    
+                    # Add bonus for passed pawns (no enemy pawns ahead)
+                    passed_pawn = True
+                    if piece.color == PieceColor.WHITE:
+                        for r in range(row-1, -1, -1):  # Check rows ahead
+                            if (col > 0 and board.get_piece(Position(r, col-1)).type == PieceType.PAWN and 
+                                board.get_piece(Position(r, col-1)).color == PieceColor.BLACK):
+                                passed_pawn = False
+                                break
+                            if (board.get_piece(Position(r, col)).type == PieceType.PAWN and
+                                board.get_piece(Position(r, col)).color == PieceColor.BLACK):
+                                passed_pawn = False
+                                break
+                            if (col < 7 and board.get_piece(Position(r, col+1)).type == PieceType.PAWN and
+                                board.get_piece(Position(r, col+1)).color == PieceColor.BLACK):
+                                passed_pawn = False
+                                break
+                    else:  # Black pawn
+                        for r in range(row+1, 8):  # Check rows ahead
+                            if (col > 0 and board.get_piece(Position(r, col-1)).type == PieceType.PAWN and
+                                board.get_piece(Position(r, col-1)).color == PieceColor.WHITE):
+                                passed_pawn = False
+                                break
+                            if (board.get_piece(Position(r, col)).type == PieceType.PAWN and
+                                board.get_piece(Position(r, col)).color == PieceColor.WHITE):
+                                passed_pawn = False
+                                break
+                            if (col < 7 and board.get_piece(Position(r, col+1)).type == PieceType.PAWN and
+                                board.get_piece(Position(r, col+1)).color == PieceColor.WHITE):
+                                passed_pawn = False
+                                break
+                    
+                    if passed_pawn:
+                        position_value += 50  # Significant bonus for passed pawns
+                    
                 elif piece.type == PieceType.KNIGHT:
-                    position_value = self.knight_table[row][col]
+                    position_value = self.knight_table[table_row][col]
                 elif piece.type == PieceType.BISHOP:
-                    position_value = self.bishop_table[row][col]
+                    position_value = self.bishop_table[table_row][col]
                 elif piece.type == PieceType.ROOK:
-                    position_value = self.rook_table[row][col]
+                    position_value = self.rook_table[table_row][col]
+                    
+                    # Bonus for rooks on open files (no pawns on the same column)
+                    open_file = True
+                    for r in range(8):
+                        if (board.get_piece(Position(r, col)).type == PieceType.PAWN and
+                            board.get_piece(Position(r, col)).color == piece.color):
+                            open_file = False
+                            break
+                    
+                    if open_file:
+                        position_value += 30  # Bonus for rook on open file
+                    
                 elif piece.type == PieceType.QUEEN:
-                    position_value = self.queen_table[row][col]
+                    position_value = self.queen_table[table_row][col]
                 elif piece.type == PieceType.KING:
                     # Use different tables for the king depending on game phase
-                    if self.count_pieces(board) < 10:  # Simple endgame check
-                        position_value = self.king_end_table[row][col]
+                    if self.count_pieces(board) < 10:
+                        position_value = self.king_end_table[table_row][col]
                     else:
-                        position_value = self.king_mid_table[row][col]
-                
-                # Invert position tables for black pieces
-                if piece.color == PieceColor.BLACK:
-                    position_value = position_value * -1
+                        position_value = self.king_mid_table[table_row][col]
                 
                 # Add to the total score
                 if piece.color == ai_color:
                     score += value + position_value
                 else:
                     score -= value + position_value
+        
+        # Center control bonus
+        for row in range(2, 6):
+            for col in range(2, 6):
+                piece = board.get_piece(Position(row, col))
+                if piece.type != PieceType.EMPTY:
+                    center_bonus = 10
+                    if piece.color == ai_color:
+                        score += center_bonus
+                    else:
+                        score -= center_bonus
+        
+        # Add penalty for repetitive positions
+        board_hash = self.hash_board(board)
+        repetition_count = self.position_history.get(board_hash, 0)
+        if repetition_count > 0:
+            repetition_penalty = repetition_count * 50
+            if board.turn == ai_color:
+                score -= repetition_penalty
+            else:
+                score += repetition_penalty
+        
+        # Bonus for having both bishops (bishop pair)
+        white_bishops = 0
+        black_bishops = 0
+        for row in range(8):
+            for col in range(8):
+                piece = board.get_piece(Position(row, col))
+                if piece.type == PieceType.BISHOP:
+                    if piece.color == PieceColor.WHITE:
+                        white_bishops += 1
+                    else:
+                        black_bishops += 1
+        
+        if white_bishops >= 2:
+            if ai_color == PieceColor.WHITE:
+                score += 50  # Bonus for having bishop pair
+            else:
+                score -= 50
+        
+        if black_bishops >= 2:
+            if ai_color == PieceColor.BLACK:
+                score += 50
+            else:
+                score -= 50
+        
+        # Mobility assessment - more legal moves is generally better
+        if board.turn == ai_color:
+            score += 5  # Small bonus just for having the move
         
         return score

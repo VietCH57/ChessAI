@@ -3,7 +3,7 @@ from typing import Optional
 
 @dataclasses.dataclass
 class AlphaZeroConfig:
-    """Configuration for AlphaZero training"""
+    """Configuration for AlphaZero training with optimization flags"""
     
     # Network Architecture
     num_residual_blocks: int = 20
@@ -40,3 +40,12 @@ class AlphaZeroConfig:
     # Hardware
     device: str = "cuda"  # or "cpu"
     num_workers: int = 4
+    
+    # Optimization flags
+    tree_reuse: bool = True 
+    data_augmentation: bool = True  
+    use_jit: bool = True  
+    half_precision: bool = True  
+    batch_mcts: bool = True 
+    use_cache: bool = True  
+    memory_efficient: bool = True 

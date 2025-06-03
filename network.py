@@ -80,6 +80,9 @@ class BoardEncoder:
         self.history_planes = 96
         self.meta_planes = 11
         
+        # Tối ưu bằng cache
+        self._empty_planes = np.zeros((119, 8, 8), dtype=np.float32)
+        
         # Pre-computed piece type mappings
         self.piece_type_to_idx = {
             PieceType.PAWN: 0,
@@ -90,79 +93,74 @@ class BoardEncoder:
             PieceType.KING: 5
         }
         
+        # Pre-allocate arrays
+        self._board_array = np.zeros((8, 8, 2), dtype=np.int8)
+        self._masks = {}
+        
     def encode_board(self, board: ChessBoard, history: list = None) -> np.ndarray:
-        """
-        Encode board state into 119-plane tensor
+        """Optimized board encoding using numpy vectorization"""
+        # Reset and reuse planes array instead of creating new one
+        planes = self._empty_planes.copy()
         
-        Args:
-            board: Current board state
-            history: List of previous board states (max 8)
-            
-        Returns:
-            numpy array of shape (119, 8, 8)
-        """
-        planes = np.zeros((119, 8, 8), dtype=np.float32)
+        # Fast piece encoding
+        self._encode_pieces_vectorized(board, planes)
         
-        # Fast piece encoding using numpy arrays
-        self._encode_pieces(board, planes)
-        
-        # Fast history encoding
+        # History encoding
         if history:
             self._encode_history(history, planes)
         
-        # Fast metadata encoding
-        self._encode_metadata(board, planes)
+        # Metadata encoding
+        self._encode_metadata_vectorized(board, planes)
         
         return planes
     
-    def _encode_pieces(self, board: ChessBoard, planes: np.ndarray):
-        """Piece encoding using vectorized operations"""
-        # Create numpy array from board state
-        board_array = np.zeros((8, 8, 2), dtype=np.int8)  # [piece_type, color]
+    def _encode_pieces_vectorized(self, board: ChessBoard, planes: np.ndarray):
+        """Highly optimized piece encoding using vectorized operations"""
+        # Reset board array
+        self._board_array.fill(0)
         
+        # Create a single pass over the board
         for row in range(8):
             for col in range(8):
                 piece = board.get_piece(Position(row, col))
                 if piece.type != PieceType.EMPTY:
                     piece_idx = self.piece_type_to_idx[piece.type]
                     color_idx = 0 if piece.color == PieceColor.WHITE else 1
-                    board_array[row, col, 0] = piece_idx + 1  # +1 to avoid 0 (empty)
-                    board_array[row, col, 1] = color_idx
+                    self._board_array[row, col, 0] = piece_idx + 1  # +1 to avoid 0 (empty)
+                    self._board_array[row, col, 1] = color_idx
         
-        # Vectorized plane filling
+        # Create all piece planes at once using boolean masks
         for piece_type_idx in range(6):  # 6 piece types
             for color_idx in range(2):  # 2 colors
                 plane_idx = piece_type_idx * 2 + color_idx
-                mask = (board_array[:, :, 0] == piece_type_idx + 1) & (board_array[:, :, 1] == color_idx)
+                mask = (self._board_array[:, :, 0] == piece_type_idx + 1) & (self._board_array[:, :, 1] == color_idx)
                 planes[plane_idx] = mask.astype(np.float32)
                 
     def _encode_history(self, history: list, planes: np.ndarray):
-        """History encoding"""
+        """Vectorized history encoding"""
         start_idx = 12
         for i, hist_board in enumerate(history[-8:]):
             if i >= 8:
                 break
             offset = i * 12
             # Reuse piece encoding for history
-            hist_planes = np.zeros((12, 8, 8), dtype=np.float32)
-            self._encode_pieces(hist_board, hist_planes)
-            planes[start_idx + offset:start_idx + offset + 12] = hist_planes
+            self._encode_pieces_vectorized(hist_board, planes[start_idx + offset:start_idx + offset + 12])
     
-    def _encode_metadata(self, board: ChessBoard, planes: np.ndarray):
-        """Fast metadata encoding using numpy broadcasting"""
+    def _encode_metadata_vectorized(self, board: ChessBoard, planes: np.ndarray):
+        """Vectorized metadata encoding"""
         idx = 12 + 96  # Start after pieces and history
         
-        # Current player (vectorized)
+        # Current player plane
         if board.turn == PieceColor.WHITE:
             planes[idx] = 1.0
         idx += 1
         
-        # Castling rights (vectorized)
+        # Castling rights (4 planes)
         castling_rights = [
-            self._can_castle_kingside(board, PieceColor.WHITE),
-            self._can_castle_queenside(board, PieceColor.WHITE),
-            self._can_castle_kingside(board, PieceColor.BLACK),
-            self._can_castle_queenside(board, PieceColor.BLACK)
+            board.can_castle_kingside(PieceColor.WHITE),
+            board.can_castle_queenside(PieceColor.WHITE),
+            board.can_castle_kingside(PieceColor.BLACK),
+            board.can_castle_queenside(PieceColor.BLACK)
         ]
         
         for can_castle in castling_rights:
@@ -170,14 +168,15 @@ class BoardEncoder:
                 planes[idx] = 1.0
             idx += 1
         
-        # En passant (optimized check)
-        if board.last_move and self._is_en_passant_possible(board):
+        # En passant (1 plane)
+        if board.last_move and board.last_move.piece.type == PieceType.PAWN and \
+           abs(board.last_move.start_pos.row - board.last_move.end_pos.row) == 2:
             en_passant_col = board.last_move.end_pos.col
             en_passant_row = 3 if board.turn == PieceColor.WHITE else 4
             planes[idx, en_passant_row, en_passant_col] = 1.0
         idx += 1
         
-        # Remaining metadata (vectorized)
+        # Remaining metadata (4 planes)
         halfmove_norm = min(board.half_move_clock / 100.0, 1.0)
         planes[idx] = halfmove_norm
         idx += 1
@@ -198,26 +197,16 @@ class BoardEncoder:
         
         # No-progress count
         planes[idx] = halfmove_norm
-    
-    def _can_castle_kingside(self, board: ChessBoard, color: PieceColor) -> bool:
-        return board.can_castle_kingside(color)
-    
-    def _can_castle_queenside(self, board: ChessBoard, color: PieceColor) -> bool:
-        return board.can_castle_queenside(color)
-    
-    def _is_en_passant_possible(self, board: ChessBoard) -> bool:
-        if not board.last_move or board.last_move.piece.type != PieceType.PAWN:
-            return False
-        return abs(board.last_move.start_pos.row - board.last_move.end_pos.row) == 2
 
 class MoveEncoder:
     """Encodes moves to/from neural network policy format"""
     
     def __init__(self):
+        # Tạo lookup tables
         self.move_to_index = {}
         self.index_to_move = {}
         self._build_move_mapping()
-    
+        
     def _build_move_mapping(self):
         """Build mapping between moves and policy indices"""
         idx = 0
@@ -233,12 +222,12 @@ class MoveEncoder:
                         idx += 1
     
     def encode_move(self, from_pos: Position, to_pos: Position) -> int:
-        """Convert move to policy index"""
+        """Convert move to policy index - optimized with lookup table"""
         move_key = (from_pos.row, from_pos.col, to_pos.row, to_pos.col)
         return self.move_to_index.get(move_key, -1)
     
     def decode_move(self, index: int) -> tuple:
-        """Convert policy index to move"""
+        """Convert policy index to move - optimized with lookup table"""
         if index in self.index_to_move:
             from_row, from_col, to_row, to_col = self.index_to_move[index]
             return Position(from_row, from_col), Position(to_row, to_col)
