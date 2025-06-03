@@ -637,47 +637,47 @@ class AlphaZeroTrainer:
         
         return win_rate
         
-def save_model(self, filename: str):
-    """Save model state with dual format for both training and inference"""
-    # Make sure the directory exists
-    os.makedirs(self.config.model_dir, exist_ok=True)
-    
-    # Fix potential path issues by normalizing the filename
-    if os.path.sep in filename:
-        # Extract just the basename if a path was provided
-        filename = os.path.basename(filename)
-    
-    model_path = os.path.join(self.config.model_dir, filename)
-    
-    # ALWAYS save a state_dict version for training
-    weights_path = os.path.splitext(model_path)[0] + "_weights.pt"
-    torch.save(self.network.state_dict(), weights_path)
-    print(f"Model weights saved to {weights_path}")
-    
-    # Then save TorchScript version for inference if GPU available
-    try:
-        if self.device.type == 'cuda':
-            self.network.eval()  # Set to eval mode for tracing
-            # Create example input
-            dummy_input = torch.zeros(1, self.config.input_planes, 8, 8, device=self.device)
-            
-            # Use scripting instead of tracing for more complete model capture
-            scripted_model = torch.jit.script(self.network)
-            
-            # Save the scripted model
-            scripted_model.save(model_path)
-            print(f"TorchScript model saved to {model_path}")
-            
-            # Restore training mode
-            self.network.train()
-        else:
-            # For CPU, just use regular state_dict
+    def save_model(self, filename: str):
+        """Save model state with dual format for both training and inference"""
+        # Make sure the directory exists
+        os.makedirs(self.config.model_dir, exist_ok=True)
+        
+        # Fix potential path issues by normalizing the filename
+        if os.path.sep in filename:
+            # Extract just the basename if a path was provided
+            filename = os.path.basename(filename)
+        
+        model_path = os.path.join(self.config.model_dir, filename)
+        
+        # ALWAYS save a state_dict version for training
+        weights_path = os.path.splitext(model_path)[0] + "_weights.pt"
+        torch.save(self.network.state_dict(), weights_path)
+        print(f"Model weights saved to {weights_path}")
+        
+        # Then save TorchScript version for inference if GPU available
+        try:
+            if self.device.type == 'cuda':
+                self.network.eval()  # Set to eval mode for tracing
+                # Create example input
+                dummy_input = torch.zeros(1, self.config.input_planes, 8, 8, device=self.device)
+                
+                # Use scripting instead of tracing for more complete model capture
+                scripted_model = torch.jit.script(self.network)
+                
+                # Save the scripted model
+                scripted_model.save(model_path)
+                print(f"TorchScript model saved to {model_path}")
+                
+                # Restore training mode
+                self.network.train()
+            else:
+                # For CPU, just use regular state_dict
+                torch.save(self.network.state_dict(), model_path)
+                print(f"Model saved to {model_path}")
+        except Exception as e:
+            print(f"Error saving TorchScript model: {e}, falling back to standard save")
             torch.save(self.network.state_dict(), model_path)
             print(f"Model saved to {model_path}")
-    except Exception as e:
-        print(f"Error saving TorchScript model: {e}, falling back to standard save")
-        torch.save(self.network.state_dict(), model_path)
-        print(f"Model saved to {model_path}")
 
     def load_model(self, filename: str):
         """Load model with compatibility for both training and PyTorch 2.6+"""
