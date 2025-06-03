@@ -349,7 +349,7 @@ def main():
     ai2 = AlphaBetaChessAI(depth=3)  # Mặc định là Alpha-Beta
     
     # Hỏi về GPU
-    use_gpu = y
+    use_gpu = True
     
     # Khởi tạo benchmark system
     benchmark = ChessBenchmark(use_gpu=use_gpu)
