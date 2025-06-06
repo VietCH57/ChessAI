@@ -316,7 +316,7 @@ class AlphaZeroMCTS:
             
             # Move to correct device
             device = next(self.network.parameters()).device
-            board_tensor = batch_tensor.to(device)
+            board_tensor = board_tensor.to(self.device)
             
             # Network evaluation
             self.network.eval()
@@ -439,8 +439,7 @@ class BatchedMCTS:
             # Run batches of simulations for efficiency
             max_sims = max(sim_counts) 
             sim_batch_size = min(32, self.batch_size // len(boards))
-            
-            # ... rest of the implementation ...
+        
             
             # Extract policy and value for each board
             for root in roots:

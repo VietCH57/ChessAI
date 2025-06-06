@@ -16,7 +16,7 @@ from headless import HeadlessChessGame
 
 class ChessBenchmark:
     """
-    Benchmark system để chạy 2 rounds 50 trận giữa 2 AI với việc đổi bên
+    Benchmark system để chạy 2 rounds 5 trận giữa 2 AI với việc đổi bên
     """
     
     def __init__(self, use_gpu=False):
@@ -131,9 +131,9 @@ class ChessBenchmark:
                 "reason": f"error: {str(e)}"
             }
     
-    def run_50_games(self, white_ai, black_ai, round_name):
+    def run_5_games(self, white_ai, black_ai, round_name):
         """
-        Chạy 50 trận đấu
+        Chạy 5 trận đấu
         
         Args:
             white_ai: AI chơi quân trắng
@@ -141,10 +141,10 @@ class ChessBenchmark:
             round_name: Tên round để hiển thị
             
         Returns:
-            dict: Thống kê kết quả 50 trận
+            dict: Thống kê kết quả 5 trận
         """
         print(f"\n{round_name}: {type(white_ai).__name__} (White) vs {type(black_ai).__name__} (Black)")
-        print(f"Running 50 games on {'GPU' if self.device else 'CPU'}...")
+        print(f"Running 5 games on {'GPU' if self.device else 'CPU'}...")
         
         results = {
             "win": 0,
@@ -174,10 +174,10 @@ class ChessBenchmark:
         if self.use_gpu and self.max_workers > 1:
             # Chạy song song với ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit tất cả 50 games
+                # Submit tất cả 5 games
                 future_to_game = {
                     executor.submit(self.run_single_game, white_ai, black_ai, i): i 
-                    for i in range(50)
+                    for i in range(5)
                 }
                 
                 # Collect results
@@ -192,14 +192,14 @@ class ChessBenchmark:
                         
                         completed += 1
                         if completed % 10 == 0:
-                            print(f"Completed {completed}/50 games...")
+                            print(f"Completed {completed}/5 games...")
                             
                     except Exception as exc:
                         print(f"Game generated an exception: {exc}")
                         results["error"] += 1
         else:
             # Chạy tuần tự
-            for i in range(50):
+            for i in range(5):
                 result = self.run_single_game(white_ai, black_ai, i)
                 outcome = result["outcome"]
                 
@@ -207,7 +207,7 @@ class ChessBenchmark:
                     results[outcome] += 1
                 
                 if (i + 1) % 10 == 0:
-                    print(f"Completed {i + 1}/50 games...")
+                    print(f"Completed {i + 1}/5 games...")
         
         round_time = time.time() - start_time
         print(f"Round completed in {round_time:.2f} seconds")
@@ -225,7 +225,7 @@ class ChessBenchmark:
     
     def run_benchmark(self, ai1, ai2):
         """
-        Chạy benchmark giữa 2 AI: 50 trận AI1 vs AI2, rồi 50 trận AI2 vs AI1
+        Chạy benchmark giữa 2 AI: 5 trận AI1 vs AI2, rồi 5 trận AI2 vs AI1
         
         Args:
             ai1: AI thứ nhất
@@ -245,10 +245,10 @@ class ChessBenchmark:
         benchmark_start = time.time()
         
         # Round 1: AI1 (White) vs AI2 (Black)
-        round1_results = self.run_50_games(ai1, ai2, "Round 1")
+        round1_results = self.run_5_games(ai1, ai2, "Round 1")
         
         # Round 2: AI2 (White) vs AI1 (Black)
-        round2_results = self.run_50_games(ai2, ai1, "Round 2")
+        round2_results = self.run_5_games(ai2, ai1, "Round 2")
         
         benchmark_time = time.time() - benchmark_start
         
@@ -279,7 +279,7 @@ class ChessBenchmark:
         total_ai2_wins = r1['loss'] + r2['win']  # AI2 thắng khi là Black + AI2 thắng khi là White  
         total_draws = r1['draw'] + r2['draw']
         total_errors = r1['error'] + r2['error']
-        total_games = 100 - total_errors
+        total_games = 10 - total_errors
         
         print(f"Total valid games: {total_games}/100")
         if total_games > 0:
@@ -340,13 +340,13 @@ def main():
     """Hàm main để chạy benchmark"""
     
     print("CHESS AI BENCHMARK TOOL")
-    print("This tool runs 50 games with AI1 as White vs AI2 as Black,")
-    print("then 50 games with AI2 as White vs AI1 as Black.")
+    print("This tool runs 5 games with AI1 as White vs AI2 as Black,")
+    print("then 5 games with AI2 as White vs AI1 as Black.")
     print()
     
     # Chọn 2 AI
-    ai1 = MinimaxChessAI(depth=3)  # Mặc định là Minimax
-    ai2 = AlphaBetaChessAI(depth=3)  # Mặc định là Alpha-Beta
+    ai1 = AlphaBetaChessAI(depth=3) 
+    ai2 = AlphaZeroChessAI.from_checkpoint(r"D:\Programming\IntroAI\ChessAI\models\checkpoint_30.pt")
     
     # Hỏi về GPU
     use_gpu = True

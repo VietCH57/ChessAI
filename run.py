@@ -15,11 +15,11 @@ def main():
     # Cấu hình game để sử dụng AI của bạn (quân trắng)
     # game.toggle_ai(white_ai=my_ai)
     minimax_ai = MinimaxChessAI(depth=3)
-    alphabeta_ai = AlphaBetaChessAI(depth=3)
-    alphazero_ai = AlphaZeroChessAI.from_checkpoint(r"D:\Programming\IntroAI\ChessAI\models\best_model.pt")
+    alphabeta_ai = AlphaBetaChessAI(depth=2)
+    alphazero_ai = AlphaZeroChessAI.from_checkpoint(r"D:\Programming\IntroAI\ChessAI\models\checkpoint_30.pt")
     
     # HOẶC, để AI của bạn chơi với AI kháckhác
-    game.toggle_ai(white_ai=alphazero_ai,black_ai=alphabeta_ai)
+    game.toggle_ai(white_ai=AlphaBetaChessAI(depth=4),black_ai=AlphaBetaChessAI(depth=5))
     
     # HOẶC, để chơi lại chính AI của bạn
     # game.toggle_ai(black_ai=AlphaBetaChessAI(depth=3))

@@ -16,7 +16,7 @@ class MinimaxChessAI(ChessAI):
             depth: How many moves ahead to look
         """
         self.depth = depth
-        self.max_time = 10  # Maximum time in seconds for a move decision
+        self.max_time = 100  # Maximum time in seconds for a move decision
         self.position_history = {}  # Track position frequency
         self.previous_moves = []    # Track last few moves
         

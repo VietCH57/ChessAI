@@ -1,9 +1,1 @@
-[
-  {
-    "iteration": 0,
-    "examples_generated": 9819,
-    "replay_buffer_size": 9819,
-    "avg_loss": 8.370598751306535,
-    "time_seconds": 311.0401916503906
-  }
-]
+[]

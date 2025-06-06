@@ -18,7 +18,7 @@ class AlphaZeroChessAI(AlphaZeroAI):
     """AlphaZero trained model for chess play using a pre-trained TorchScript model"""
 
     @classmethod
-    def from_checkpoint(cls, model_path: str, num_simulations: int = 200):
+    def from_checkpoint(cls, model_path: str, num_simulations: int = 400):
         config = AlphaZeroConfig(
             num_simulations=num_simulations,
             num_residual_blocks=12,

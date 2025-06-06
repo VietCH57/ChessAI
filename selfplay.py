@@ -280,6 +280,11 @@ class SelfPlayGenerator:
         )
         ai.reset_move_count()
         
+        # Ensure network is on gpu
+        if self.device.type == 'cuda':
+            self.network = self.network.to(self.device)
+            self.network.eval()
+            
         # Track data for training examples
         game_data = []
         board_history = []  # For encoding historical positions

@@ -79,9 +79,9 @@ class AlphaZeroDataset(Dataset):
             
             # Move to device
             if self.device.type == 'cuda':
-                states = states.pin_memory()
-                policies = policies.pin_memory()
-                outcomes = outcomes.pin_memory()
+                states = states.to(self.device)
+                policies = policies.to(self.device)
+                outcomes = outcomes.to(self.device)
             
             # Update examples with pre-processed tensors
             for i, idx in enumerate(range(start_idx, end_idx)):
